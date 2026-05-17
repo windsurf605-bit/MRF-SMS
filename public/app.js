@@ -22,6 +22,7 @@ const state = {
     theme: 'light',
     otpPollInFlight: false,
     otpNotificationKeys: new Set(),
+    hiddenCancelledOrderIds: new Set(),
     expireRequestInFlight: false,
     historyView: 'activations',
     numberHistorySearch: '',
@@ -1520,6 +1521,31 @@ function getOrderFromState(orderId) {
     return state.orders.find((order) => String(order.id) === String(orderId)) || null;
 }
 
+function normalizeDashboardOrderId(orderOrId) {
+    if (orderOrId == null) return '';
+    if (typeof orderOrId === 'object') {
+        return orderOrId.id == null ? '' : String(orderOrId.id).trim();
+    }
+    return String(orderOrId).trim();
+}
+
+function isCancelledOrderHidden(orderOrId) {
+    const normalizedOrderId = normalizeDashboardOrderId(orderOrId);
+    return Boolean(normalizedOrderId) && state.hiddenCancelledOrderIds.has(normalizedOrderId);
+}
+
+function filterHiddenCancelledOrders(orders) {
+    return (Array.isArray(orders) ? orders : []).filter((order) => !isCancelledOrderHidden(order));
+}
+
+function suppressCancelledOrderInDashboard(orderId) {
+    const normalizedOrderId = normalizeDashboardOrderId(orderId);
+    if (!normalizedOrderId) return;
+    state.hiddenCancelledOrderIds.add(normalizedOrderId);
+    state.orders = filterHiddenCancelledOrders(state.orders);
+    state.completedOrders = filterHiddenCancelledOrders(state.completedOrders);
+}
+
 function formatCountdown(targetValue, expiredLabel = 'Expired') {
     const target = targetValue ? new Date(targetValue) : null;
     if (!target || Number.isNaN(target.getTime())) return expiredLabel;
@@ -2026,9 +2052,13 @@ function syncInlineOrderTimers() {
 
 function upsertOrderInState(order) {
     if (!order || order.id == null) return;
+    const normalizedOrderId = normalizeDashboardOrderId(order);
     const lifecycleStatus = getOrderLifecycleStatus(order);
-    state.orders = (Array.isArray(state.orders) ? state.orders : []).filter((item) => String(item.id) !== String(order.id));
-    state.completedOrders = (Array.isArray(state.completedOrders) ? state.completedOrders : []).filter((item) => String(item.id) !== String(order.id));
+    state.orders = (Array.isArray(state.orders) ? state.orders : []).filter((item) => normalizeDashboardOrderId(item) !== normalizedOrderId);
+    state.completedOrders = (Array.isArray(state.completedOrders) ? state.completedOrders : []).filter((item) => normalizeDashboardOrderId(item) !== normalizedOrderId);
+    if (isCancelledOrderHidden(normalizedOrderId)) {
+        return;
+    }
     if (lifecycleStatus === 'completed') {
         state.completedOrders = sortOrdersByMostRecent([order, ...state.completedOrders]);
         return;
@@ -2054,12 +2084,13 @@ function mergeFetchedOrderWithLocalState(fetchedOrder, localOrder) {
 }
 
 function mergeOrdersWithLocalState(fetchedOrders) {
-    const localOrdersById = new Map((state.orders || []).map((order) => [String(order.id), order]));
+    const localOrders = filterHiddenCancelledOrders(state.orders || []);
+    const localOrdersById = new Map(localOrders.map((order) => [String(order.id), order]));
     const normalizedFetchedOrders = Array.isArray(fetchedOrders)
-        ? fetchedOrders.map((order) => mergeFetchedOrderWithLocalState(order, localOrdersById.get(String(order?.id))))
+        ? filterHiddenCancelledOrders(fetchedOrders).map((order) => mergeFetchedOrderWithLocalState(order, localOrdersById.get(String(order?.id))))
         : [];
     const fetchedIds = new Set(normalizedFetchedOrders.map((order) => String(order.id)));
-    const localPendingOrders = state.orders.filter((order) => {
+    const localPendingOrders = localOrders.filter((order) => {
         if (!order || order.id == null) return false;
         if (fetchedIds.has(String(order.id))) return false;
         return ['pending', 'active'].includes(getOrderLifecycleStatus(order));
@@ -2113,6 +2144,9 @@ async function refreshActiveOrderState(orderId, options = {}) {
     const refreshed = await fetchJSON(`/api/orders/${orderId}`);
     upsertOrderInState(refreshed);
     renderActiveOrders(state.orders);
+    if (isCancelledOrderHidden(refreshed)) {
+        return refreshed;
+    }
     const shouldUpdateModal = options.updateModal ?? Boolean(state.activeOrder && String(state.activeOrder.id) === String(orderId));
     if (shouldUpdateModal) {
         state.activeOrder = refreshed;
@@ -2345,7 +2379,7 @@ function renderCompletedOrders() {
 function renderActiveOrders(orders) {
     const container = qs('active-orders-list');
     if (!container) return;
-    state.orders = sortOrdersByMostRecent((Array.isArray(orders) ? orders : []).filter((order) => ['pending', 'active'].includes(getOrderLifecycleStatus(order))));
+    state.orders = sortOrdersByMostRecent(filterHiddenCancelledOrders(orders).filter((order) => ['pending', 'active'].includes(getOrderLifecycleStatus(order))));
     syncInlineOrderPolling();
     syncInlineOrderTimers();
     updateActivationSummaryLine();
@@ -3268,6 +3302,7 @@ async function checkAuth() {
         state.completedOrders = [];
         state.numberHistory = [];
         state.otpNotificationKeys = new Set();
+        state.hiddenCancelledOrderIds = new Set();
         state.paymentRequests = [];
         state.referralProgram = null;
         state.adminReferrals = [];
@@ -3407,6 +3442,7 @@ async function logout() {
         state.completedOrders = [];
         state.numberHistory = [];
         state.otpNotificationKeys = new Set();
+        state.hiddenCancelledOrderIds = new Set();
         state.paymentRequests = [];
         state.historyView = 'activations';
         state.numberHistorySearch = '';
@@ -3637,12 +3673,11 @@ async function cancelActiveOrder(orderId) {
         const message = await response.text();
         if (!response.ok) throw new Error(message);
         showToast(message || 'Order cancelled & refunded', 'success');
+        suppressCancelledOrderInDashboard(targetOrderId);
         if (state.activeOrder && String(state.activeOrder.id) === String(targetOrderId)) {
             closeOrderModal();
         }
         // Instantly remove from the view; do NOT refresh from server to avoid flicker
-        state.orders = state.orders.filter(order => String(order.id) !== String(targetOrderId));
-        state.completedOrders = state.completedOrders.filter(order => String(order.id) !== String(targetOrderId));
         renderActiveOrders(state.orders);
         updateActivationSummaryLine();
         await loadNumberHistory();
