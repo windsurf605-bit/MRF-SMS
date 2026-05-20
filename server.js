@@ -111,6 +111,18 @@ const EXPIRED_REFUND_MESSAGE = 'Time expired. Your money has been returned to yo
 const ORDER_FINAL_STATUSES = new Set(['completed', 'cancelled', 'expired', 'expired_refunded', 'refunded']);
 const ORDER_PROVIDER_WAITING_STATUS = 'STATUS_WAIT_CODE';
 const ORDER_HOTFIX_AUDIT_PREFIX = '[ORDER_HOTFIX]';
+const PROVIDER_AUDIT_PREFIX = '[PROVIDER_ANALYTICS]';
+const PROVIDER_BALANCE_ACTION = 'getBalance';
+const PROVIDER_BALANCE_CURRENCY = 'USD';
+const PROVIDER_PKR_EXCHANGE_RATE = 280;
+const PROVIDER_BALANCE_EPSILON = 0.0001;
+const PROVIDER_RECONCILIATION_INTERVAL_MS = Math.max(60000, Number(process.env.PROVIDER_RECONCILIATION_INTERVAL_MS || 180000));
+const SECURITY_MAX_CANCELLATIONS_PER_HOUR = Math.max(1, Number(process.env.SECURITY_MAX_CANCELLATIONS_PER_HOUR || 4));
+const SECURITY_MAX_REFUNDS_PER_DAY = Math.max(1, Number(process.env.SECURITY_MAX_REFUNDS_PER_DAY || 8));
+const SECURITY_MAX_SUSPICIOUS_ACTIONS = Math.max(1, Number(process.env.SECURITY_MAX_SUSPICIOUS_ACTIONS || 5));
+const SECURITY_CANCEL_COOLDOWN_MINUTES = Math.max(5, Number(process.env.SECURITY_CANCEL_COOLDOWN_MINUTES || 30));
+const SECURITY_AUTO_BLOCK_HOURS = Math.max(1, Number(process.env.SECURITY_AUTO_BLOCK_HOURS || 12));
+const SECURITY_POST_CLOSE_POLL_LIMIT = Math.max(2, Number(process.env.SECURITY_POST_CLOSE_POLL_LIMIT || 3));
 const ORDER_COOLDOWN_SECONDS = 30;
 const REFERRAL_MIN_DEPOSIT_PKR = 170;
 const REFERRAL_BONUS_PKR = 100;
@@ -288,7 +300,10 @@ function normalizeUser(row) {
         is_admin: Boolean(row.is_admin),
         referralCode: row.referral_code,
         is_active: row.is_active,
-        login_attempts: row.login_attempts
+        login_attempts: row.login_attempts,
+        security_risk_score: Number(row.security_risk_score || 0),
+        security_risk_status: String(row.security_risk_status || 'safe').trim().toLowerCase() || 'safe',
+        security_blocked_until: row.security_blocked_until || null
     };
 }
 
@@ -310,6 +325,13 @@ function normalizeOrderStatus(row) {
 function normalizeOrder(row) {
     if (!row) return null;
     const status = normalizeOrderStatus(row);
+    const providerStatus = String(row.provider_status || row.provider_last_status || '').trim() || null;
+    const providerFinalStatus = String(row.provider_final_status || '').trim() || null;
+    const websiteCharge = row.website_charge == null ? Number(row.price || 0) : Number(row.website_charge || 0);
+    const websiteRefund = row.website_refund == null ? 0 : Number(row.website_refund || 0);
+    const realProviderCost = row.real_provider_cost == null ? 0 : Number(row.real_provider_cost || 0);
+    const smsReceived = Boolean(row.sms_received || row.otp_received || String(row.otp_code || '').trim());
+    const providerUsed = Boolean(row.provider_used || smsReceived || isProviderNonPendingStatus(providerStatus) || isProviderNonPendingStatus(providerFinalStatus));
     return {
         ...row,
         price: Number(row.price || 0),
@@ -317,8 +339,39 @@ function normalizeOrder(row) {
         client_balance_left: row.client_balance_left == null ? null : Number(row.client_balance_left),
         profit_pkr: row.profit_pkr == null ? null : Number(row.profit_pkr),
         otp_received: Boolean(row.otp_received),
-        sms_received: Boolean(row.sms_received || row.otp_received || String(row.otp_code || '').trim()),
+        sms_received: smsReceived,
         provider_last_status: String(row.provider_last_status || '').trim() || null,
+        provider_partner_id: row.provider_partner_id == null ? null : Number(row.provider_partner_id),
+        provider_price_usd: row.provider_price_usd == null ? 0 : Number(row.provider_price_usd || 0),
+        provider_balance_before: row.provider_balance_before == null ? null : Number(row.provider_balance_before),
+        provider_balance_after: row.provider_balance_after == null ? null : Number(row.provider_balance_after),
+        provider_balance_currency: String(row.provider_balance_currency || PROVIDER_BALANCE_CURRENCY).trim() || PROVIDER_BALANCE_CURRENCY,
+        real_provider_cost: realProviderCost,
+        real_provider_cost_provider_currency: row.real_provider_cost_provider_currency == null ? 0 : Number(row.real_provider_cost_provider_currency || 0),
+        provider_cost_source: String(row.provider_cost_source || '').trim() || null,
+        provider_cost_verified: Boolean(row.provider_cost_verified),
+        provider_status: providerStatus,
+        provider_final_status: providerFinalStatus,
+        provider_country: String(row.provider_country || row.country || '').trim() || null,
+        provider_service: String(row.provider_service || row.service_type || '').trim() || null,
+        provider_phone_number: String(row.provider_phone_number || row.phone_number || '').trim() || null,
+        provider_used: providerUsed,
+        provider_used_at: row.provider_used_at || null,
+        provider_status_synced_at: row.provider_status_synced_at || null,
+        website_charge: websiteCharge,
+        website_refund: websiteRefund,
+        website_profit: row.website_profit == null ? roundMoney(websiteCharge - websiteRefund) : Number(row.website_profit || 0),
+        real_profit_loss: row.real_profit_loss == null ? roundMoney(websiteCharge - websiteRefund - realProviderCost) : Number(row.real_profit_loss || 0),
+        risk_flag: Boolean(row.risk_flag),
+        loss_detected: Boolean(row.loss_detected),
+        critical_exploit: Boolean(row.critical_exploit),
+        exploit_reason: String(row.exploit_reason || '').trim() || null,
+        exploit_reason_detail: String(row.exploit_reason_detail || '').trim() || null,
+        refunded_at: row.refunded_at || null,
+        refund_locked_at: row.refund_locked_at || (providerUsed ? (row.sms_received_at || row.completed_at || row.created_at || null) : null),
+        post_close_poll_count: Number(row.post_close_poll_count || 0),
+        duplicate_cancel_attempts: Number(row.duplicate_cancel_attempts || 0),
+        username_snapshot: String(row.username_snapshot || row.user_name || row.name || '').trim() || null,
         sms_received_at: row.sms_received_at || null,
         status
     };
@@ -356,6 +409,222 @@ function logOrderHotfixEvent(eventName, order, details = {}) {
         providerError: details.providerError || null,
         reason: details.reason || null
     });
+}
+
+function getOrderUsernameSnapshot(order) {
+    return String(order?.username_snapshot || order?.user_name || order?.name || '').trim() || null;
+}
+
+function isProviderNonPendingStatus(status) {
+    const normalizedStatus = String(status || '').trim().toUpperCase();
+    return Boolean(normalizedStatus)
+        && normalizedStatus !== ORDER_PROVIDER_WAITING_STATUS
+        && normalizedStatus !== 'ACCESS_CANCEL'
+        && normalizedStatus !== 'STATUS_CANCEL';
+}
+
+function getProviderOrderStatus(order) {
+    return String(order?.provider_final_status || order?.provider_status || order?.provider_last_status || '').trim() || null;
+}
+
+function isProviderUsedOrder(order) {
+    return Boolean(order?.provider_used || order?.sms_received || hasStoredOtp(order) || isProviderNonPendingStatus(getProviderOrderStatus(order)));
+}
+
+function getWebsiteChargeAmount(order) {
+    return roundMoney(order?.website_charge != null ? order.website_charge : order?.price || 0);
+}
+
+function getWebsiteRefundAmount(order) {
+    return roundMoney(order?.website_refund || 0);
+}
+
+function getRealProviderCostAmount(order) {
+    return roundMoney(order?.real_provider_cost || 0);
+}
+
+function getWebsiteProfitAmount(order) {
+    return roundMoney(order?.website_profit != null ? order.website_profit : getWebsiteChargeAmount(order) - getWebsiteRefundAmount(order));
+}
+
+function getRealProfitLossAmount(order) {
+    return roundMoney(order?.real_profit_loss != null ? order.real_profit_loss : getWebsiteChargeAmount(order) - getWebsiteRefundAmount(order) - getRealProviderCostAmount(order));
+}
+
+function calculateRiskStatus(score) {
+    if (Number(score || 0) >= 80) return 'dangerous';
+    if (Number(score || 0) >= 30) return 'suspicious';
+    return 'safe';
+}
+
+function logProviderAudit(eventName, details = {}) {
+    console.info(PROVIDER_AUDIT_PREFIX, {
+        event: eventName,
+        timestamp: new Date().toISOString(),
+        ...details
+    });
+}
+
+function parseProviderBalanceResponse(data) {
+    if (typeof data === 'string') {
+        const trimmed = data.trim();
+        if (trimmed.toUpperCase().startsWith('ACCESS_BALANCE:')) {
+            const parsedBalance = Number(trimmed.slice(trimmed.indexOf(':') + 1).trim());
+            if (Number.isFinite(parsedBalance)) {
+                return {
+                    success: true,
+                    balance: roundMoney(parsedBalance, 6),
+                    currency: PROVIDER_BALANCE_CURRENCY,
+                    raw: trimmed
+                };
+            }
+        }
+        return {
+            success: false,
+            error: trimmed || 'Provider balance unavailable',
+            raw: trimmed
+        };
+    }
+    if (data && typeof data === 'object') {
+        const candidateBalance = Number(data.balance ?? data.amount ?? data.availableBalance);
+        if (Number.isFinite(candidateBalance)) {
+            return {
+                success: true,
+                balance: roundMoney(candidateBalance, 6),
+                currency: String(data.currency || PROVIDER_BALANCE_CURRENCY).trim() || PROVIDER_BALANCE_CURRENCY,
+                raw: JSON.stringify(data)
+            };
+        }
+    }
+    return {
+        success: false,
+        error: 'Provider balance unavailable',
+        raw: data == null ? '' : String(data)
+    };
+}
+
+function computeProviderCostMetrics({ balanceBefore, balanceAfter, activationCost, providerPrice }) {
+    const beforeBalance = Number(balanceBefore);
+    const afterBalance = Number(balanceAfter);
+    const providerActivationCost = Number(activationCost);
+    const providerTierPrice = Number(providerPrice);
+    const balanceDiff = Number.isFinite(beforeBalance) && Number.isFinite(afterBalance)
+        ? roundMoney(Math.max(0, beforeBalance - afterBalance), 6)
+        : null;
+    let providerCurrencyCost = null;
+    let costSource = null;
+    if (Number.isFinite(balanceDiff) && balanceDiff > PROVIDER_BALANCE_EPSILON) {
+        providerCurrencyCost = balanceDiff;
+        costSource = 'balance_diff';
+    } else if (Number.isFinite(providerActivationCost) && providerActivationCost > PROVIDER_BALANCE_EPSILON) {
+        providerCurrencyCost = roundMoney(providerActivationCost, 6);
+        costSource = 'activation_cost';
+    } else if (Number.isFinite(providerTierPrice) && providerTierPrice > PROVIDER_BALANCE_EPSILON) {
+        providerCurrencyCost = roundMoney(providerTierPrice, 6);
+        costSource = 'provider_price';
+    }
+    return {
+        providerCurrencyCost: providerCurrencyCost == null ? 0 : providerCurrencyCost,
+        providerCostPkr: providerCurrencyCost == null ? 0 : usdToPkr(providerCurrencyCost),
+        costSource,
+        balanceDiff: balanceDiff == null ? null : balanceDiff,
+        balanceVerified: Number.isFinite(balanceDiff) && balanceDiff > PROVIDER_BALANCE_EPSILON
+    };
+}
+
+function computeProviderRefundRecoveryMetrics(order, { balanceBeforeAction, balanceAfterAction }) {
+    const beforeBalance = Number(balanceBeforeAction);
+    const afterBalance = Number(balanceAfterAction);
+    const previousProviderCostCurrency = roundMoney(order?.real_provider_cost_provider_currency || 0, 6);
+    const recoveredCurrency = Number.isFinite(beforeBalance) && Number.isFinite(afterBalance)
+        ? roundMoney(Math.max(0, afterBalance - beforeBalance), 6)
+        : 0;
+    const remainingCurrency = roundMoney(Math.max(0, previousProviderCostCurrency - recoveredCurrency), 6);
+    return {
+        previousProviderCostCurrency,
+        recoveredCurrency,
+        recoveredPkr: usdToPkr(recoveredCurrency),
+        remainingCurrency,
+        remainingPkr: usdToPkr(remainingCurrency),
+        balanceVerified: Number.isFinite(beforeBalance) && Number.isFinite(afterBalance)
+    };
+}
+
+function evaluateOrderRiskFlags(order) {
+    const reasons = [];
+    const details = [];
+    const websiteCharge = getWebsiteChargeAmount(order);
+    const websiteRefund = getWebsiteRefundAmount(order);
+    const realProviderCost = getRealProviderCostAmount(order);
+    const providerStatus = getProviderOrderStatus(order);
+    const rawStatus = getRawOrderStatus(order);
+    const providerUsed = isProviderUsedOrder(order);
+    if (websiteRefund > 0 && (hasStoredOtp(order) || order?.sms_received)) {
+        reasons.push('otp_or_sms_refunded');
+        details.push('OTP or SMS was received while a refund was issued.');
+    }
+    if (websiteRefund > 0 && realProviderCost > 0) {
+        reasons.push('provider_cost_refunded');
+        details.push('Provider balance/cost was charged while the website issued a refund.');
+    }
+    if (rawStatus === 'cancelled' && providerUsed) {
+        reasons.push('cancelled_after_provider_use');
+        details.push('Order was cancelled after a provider success/non-pending signal.');
+    }
+    if (websiteRefund > 0 && isProviderNonPendingStatus(providerStatus)) {
+        reasons.push('provider_non_pending_refunded');
+        details.push('Provider reported a non-pending state while the website refunded the user.');
+    }
+    if (Number(order?.post_close_poll_count || 0) >= SECURITY_POST_CLOSE_POLL_LIMIT) {
+        reasons.push('multiple_refreshes_after_close');
+        details.push('Repeated OTP polling/refresh attempts were detected after the order was closed.');
+    }
+    if (realProviderCost > 0 && websiteCharge <= 0) {
+        reasons.push('provider_charged_without_website_charge');
+        details.push('Provider charged balance while the website recorded no charge.');
+    }
+    const criticalReasons = new Set([
+        'otp_or_sms_refunded',
+        'provider_cost_refunded',
+        'cancelled_after_provider_use',
+        'provider_non_pending_refunded',
+        'provider_charged_without_website_charge'
+    ]);
+    return {
+        riskFlag: reasons.length > 0,
+        lossDetected: reasons.some((reason) => criticalReasons.has(reason)),
+        criticalExploit: reasons.some((reason) => criticalReasons.has(reason)),
+        exploitReason: reasons[0] || null,
+        exploitReasonDetail: details.join(' ') || null,
+        reasons
+    };
+}
+
+function buildDerivedOrderMetrics(order, overrides = {}) {
+    const providerStatus = overrides.providerStatus ?? (String(order?.provider_status || order?.provider_last_status || '').trim() || null);
+    const providerFinalStatus = overrides.providerFinalStatus ?? (String(order?.provider_final_status || '').trim() || (isProviderNonPendingStatus(providerStatus) ? providerStatus : null));
+    const websiteCharge = overrides.websiteCharge ?? getWebsiteChargeAmount(order);
+    const websiteRefund = overrides.websiteRefund ?? getWebsiteRefundAmount(order);
+    const realProviderCost = overrides.realProviderCost ?? getRealProviderCostAmount(order);
+    const providerUsed = overrides.providerUsed ?? Boolean(order?.provider_used || order?.sms_received || hasStoredOtp(order) || isProviderNonPendingStatus(providerFinalStatus || providerStatus));
+    const websiteProfit = overrides.websiteProfit ?? roundMoney(websiteCharge - websiteRefund);
+    const realProfitLoss = overrides.realProfitLoss ?? roundMoney(websiteCharge - websiteRefund - realProviderCost);
+    const mergedOrder = {
+        ...order,
+        provider_status: providerStatus,
+        provider_final_status: providerFinalStatus,
+        provider_used: providerUsed,
+        website_charge: websiteCharge,
+        website_refund: websiteRefund,
+        website_profit: websiteProfit,
+        real_provider_cost: realProviderCost,
+        real_profit_loss: realProfitLoss,
+        post_close_poll_count: overrides.postClosePollCount ?? Number(order?.post_close_poll_count || 0)
+    };
+    return {
+        ...mergedOrder,
+        riskState: evaluateOrderRiskFlags(mergedOrder)
+    };
 }
 
 function normalizeNumberHistoryEntry(row) {
@@ -470,7 +739,17 @@ function waitMs(ms) {
 }
 
 function pkrToUsd(pkr) {
-    return parseFloat((pkr / 280).toFixed(3));
+    return parseFloat((Number(pkr || 0) / PROVIDER_PKR_EXCHANGE_RATE).toFixed(3));
+}
+
+function usdToPkr(usd) {
+    return Number((Number(usd || 0) * PROVIDER_PKR_EXCHANGE_RATE).toFixed(2));
+}
+
+function roundMoney(value, decimals = 2) {
+    const numericValue = Number(value || 0);
+    if (!Number.isFinite(numericValue)) return 0;
+    return Number(numericValue.toFixed(decimals));
 }
 
 function formatSafeError(err, fallback = 'Server error') {
@@ -656,6 +935,10 @@ async function initDB() {
     await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_ip TEXT');
     await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_device_fingerprint TEXT');
     await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_browser_fingerprint TEXT');
+    await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_blocked_until TIMESTAMPTZ');
+    await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_risk_score INTEGER DEFAULT 0');
+    await queryRun("ALTER TABLE users ADD COLUMN IF NOT EXISTS security_risk_status TEXT DEFAULT 'safe'");
+    await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_last_flagged_at TIMESTAMPTZ');
     await queryRun("UPDATE users SET is_admin = TRUE WHERE LOWER(COALESCE(role, 'user')) = 'admin'");
     await queryRun('CREATE UNIQUE INDEX IF NOT EXISTS users_googleId_unique_idx ON users ("googleId") WHERE "googleId" IS NOT NULL');
     await queryRun('CREATE INDEX IF NOT EXISTS idx_users_referred_by_user_id ON users (referred_by_user_id)');
@@ -699,6 +982,37 @@ async function initDB() {
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS sms_received BOOLEAN DEFAULT FALSE');
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS sms_received_at TIMESTAMPTZ');
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_last_status TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS username_snapshot TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_partner_id INTEGER');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_price_usd NUMERIC(12,6) DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_balance_before NUMERIC(18,6)');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_balance_after NUMERIC(18,6)');
+    await queryRun("ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_balance_currency TEXT DEFAULT 'USD'");
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS real_provider_cost NUMERIC(12,2) DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS real_provider_cost_provider_currency NUMERIC(18,6) DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_cost_source TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_cost_verified BOOLEAN DEFAULT FALSE');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_status TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_final_status TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_country TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_service TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_phone_number TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_used BOOLEAN DEFAULT FALSE');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_used_at TIMESTAMPTZ');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_status_synced_at TIMESTAMPTZ');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS website_charge NUMERIC(12,2) DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS website_refund NUMERIC(12,2) DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS website_profit NUMERIC(12,2) DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS real_profit_loss NUMERIC(12,2) DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS risk_flag BOOLEAN DEFAULT FALSE');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS loss_detected BOOLEAN DEFAULT FALSE');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS critical_exploit BOOLEAN DEFAULT FALSE');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS exploit_reason TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS exploit_reason_detail TEXT');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_locked_at TIMESTAMPTZ');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS post_close_poll_count INTEGER DEFAULT 0');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS duplicate_cancel_attempts INTEGER DEFAULT 0');
     await queryRun('UPDATE orders SET last_purchase_at = COALESCE(last_purchase_at, created_at, CURRENT_TIMESTAMP)');
     await queryRun(`
         UPDATE orders
@@ -878,6 +1192,57 @@ async function initDB() {
         WHERE o.user_id IS NOT NULL
         ON CONFLICT (order_id) DO NOTHING
     `);
+
+    await queryRun(`
+        CREATE TABLE IF NOT EXISTS provider_balance_snapshots (
+            id SERIAL PRIMARY KEY,
+            order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            activation_id TEXT,
+            reason TEXT NOT NULL,
+            provider_balance NUMERIC(18,6) NOT NULL,
+            previous_balance NUMERIC(18,6),
+            delta NUMERIC(18,6),
+            delta_pkr NUMERIC(12,2) DEFAULT 0,
+            expected_spend_pkr NUMERIC(12,2) DEFAULT 0,
+            unmatched_delta_pkr NUMERIC(12,2) DEFAULT 0,
+            anomaly_flag BOOLEAN DEFAULT FALSE,
+            note TEXT,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+    await queryRun('CREATE INDEX IF NOT EXISTS idx_provider_balance_snapshots_created_at ON provider_balance_snapshots (created_at DESC)');
+    await queryRun('CREATE INDEX IF NOT EXISTS idx_provider_balance_snapshots_order_id ON provider_balance_snapshots (order_id, created_at DESC)');
+
+    await queryRun(`
+        CREATE TABLE IF NOT EXISTS provider_security_events (
+            id SERIAL PRIMARY KEY,
+            order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            username TEXT,
+            service_type TEXT,
+            country TEXT,
+            phone_number TEXT,
+            activation_id TEXT,
+            event_type TEXT NOT NULL,
+            reason TEXT,
+            risk_flag BOOLEAN DEFAULT FALSE,
+            loss_detected BOOLEAN DEFAULT FALSE,
+            critical_exploit BOOLEAN DEFAULT FALSE,
+            provider_status TEXT,
+            provider_final_status TEXT,
+            provider_balance_before NUMERIC(18,6),
+            provider_balance_after NUMERIC(18,6),
+            real_provider_cost NUMERIC(12,2) DEFAULT 0,
+            website_charge NUMERIC(12,2) DEFAULT 0,
+            website_refund NUMERIC(12,2) DEFAULT 0,
+            real_profit_loss NUMERIC(12,2) DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+    await queryRun('CREATE INDEX IF NOT EXISTS idx_provider_security_events_order_id ON provider_security_events (order_id, created_at DESC)');
+    await queryRun('CREATE INDEX IF NOT EXISTS idx_provider_security_events_user_id ON provider_security_events (user_id, created_at DESC)');
+    await queryRun('CREATE INDEX IF NOT EXISTS idx_provider_security_events_risk_flags ON provider_security_events (critical_exploit, loss_detected, risk_flag, created_at DESC)');
 
     await queryRun(`
         CREATE TABLE IF NOT EXISTS transactions (
@@ -1531,7 +1896,18 @@ async function getOrdersByUser(userId) {
 
 async function getAdminUsers() {
     const rows = await queryAll(`
-        SELECT id, name, email, balance, role, is_admin, created_at
+        SELECT
+            id,
+            name,
+            email,
+            balance,
+            role,
+            is_admin,
+            created_at,
+            security_risk_score,
+            security_risk_status,
+            security_blocked_until,
+            security_last_flagged_at
         FROM users
         ORDER BY id DESC
     `);
@@ -1797,12 +2173,438 @@ async function updateOrder(orderId, updates, options = {}) {
     return updatedOrder;
 }
 
+async function getProviderBalance() {
+    try {
+        const url = `${SMSBOWER_URL}?api_key=${SMSBOWER_API_KEY}&action=${PROVIDER_BALANCE_ACTION}`;
+        const response = await axios.get(url, { timeout: 15000 });
+        return parseProviderBalanceResponse(response.data);
+    } catch (err) {
+        return {
+            success: false,
+            error: formatSafeError(err, 'Provider balance unavailable'),
+            raw: ''
+        };
+    }
+}
+
+async function getLatestProviderBalanceSnapshot(options = {}) {
+    const executor = options.client || pool;
+    const result = await executor.query(`
+        SELECT *
+        FROM provider_balance_snapshots
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+    `);
+    return result.rows[0] || null;
+}
+
+async function getLastProviderReconciliationSnapshot(options = {}) {
+    const executor = options.client || pool;
+    const result = await executor.query(`
+        SELECT *
+        FROM provider_balance_snapshots
+        WHERE reason IN ('startup_reconciliation', 'scheduled_reconciliation')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+    `);
+    return result.rows[0] || null;
+}
+
+async function insertProviderBalanceSnapshot(snapshot, options = {}) {
+    const providerBalance = Number(snapshot?.providerBalance);
+    if (!Number.isFinite(providerBalance)) return null;
+    const executor = options.client || pool;
+    const previousBalance = snapshot?.previousBalance == null ? null : Number(snapshot.previousBalance);
+    const delta = previousBalance == null || !Number.isFinite(previousBalance)
+        ? null
+        : roundMoney(previousBalance - providerBalance, 6);
+    const deltaPkr = delta == null ? 0 : usdToPkr(delta);
+    const result = await executor.query(`
+        INSERT INTO provider_balance_snapshots (
+            order_id,
+            user_id,
+            activation_id,
+            reason,
+            provider_balance,
+            previous_balance,
+            delta,
+            delta_pkr,
+            expected_spend_pkr,
+            unmatched_delta_pkr,
+            anomaly_flag,
+            note
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING *
+    `, [
+        snapshot?.orderId == null ? null : Number(snapshot.orderId),
+        snapshot?.userId == null ? null : Number(snapshot.userId),
+        String(snapshot?.activationId || '').trim() || null,
+        String(snapshot?.reason || 'unknown').trim() || 'unknown',
+        roundMoney(providerBalance, 6),
+        previousBalance == null || !Number.isFinite(previousBalance) ? null : roundMoney(previousBalance, 6),
+        delta == null ? null : delta,
+        roundMoney(deltaPkr, 2),
+        roundMoney(snapshot?.expectedSpendPkr || 0, 2),
+        roundMoney(snapshot?.unmatchedDeltaPkr || 0, 2),
+        Boolean(snapshot?.anomalyFlag),
+        String(snapshot?.note || '').trim() || null
+    ]);
+    logProviderAudit('balance_snapshot_recorded', {
+        orderId: snapshot?.orderId ?? null,
+        userId: snapshot?.userId ?? null,
+        activationId: String(snapshot?.activationId || '').trim() || null,
+        reason: String(snapshot?.reason || 'unknown').trim() || 'unknown',
+        providerBalance: roundMoney(providerBalance, 6),
+        previousBalance: previousBalance == null || !Number.isFinite(previousBalance) ? null : roundMoney(previousBalance, 6),
+        delta: delta == null ? null : delta,
+        anomalyFlag: Boolean(snapshot?.anomalyFlag)
+    });
+    return result.rows[0] || null;
+}
+
+async function insertProviderSecurityEvent(order, details = {}, options = {}) {
+    const executor = options.client || pool;
+    const normalizedOrder = normalizeOrder(order);
+    const derivedOrder = normalizedOrder ? buildDerivedOrderMetrics(normalizedOrder) : null;
+    const sourceOrder = derivedOrder || normalizedOrder || null;
+    const riskFlag = Boolean(details.riskFlag ?? sourceOrder?.risk_flag ?? false);
+    const lossDetected = Boolean(details.lossDetected ?? sourceOrder?.loss_detected ?? false);
+    const criticalExploit = Boolean(details.criticalExploit ?? sourceOrder?.critical_exploit ?? false);
+    const result = await executor.query(`
+        INSERT INTO provider_security_events (
+            order_id,
+            user_id,
+            username,
+            service_type,
+            country,
+            phone_number,
+            activation_id,
+            event_type,
+            reason,
+            risk_flag,
+            loss_detected,
+            critical_exploit,
+            provider_status,
+            provider_final_status,
+            provider_balance_before,
+            provider_balance_after,
+            real_provider_cost,
+            website_charge,
+            website_refund,
+            real_profit_loss
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+        )
+        RETURNING *
+    `, [
+        sourceOrder?.id == null ? null : Number(sourceOrder.id),
+        sourceOrder?.user_id == null ? null : Number(sourceOrder.user_id),
+        String(details.username || getOrderUsernameSnapshot(sourceOrder) || '').trim() || null,
+        String(details.serviceType || sourceOrder?.service_type || sourceOrder?.provider_service || '').trim() || null,
+        String(details.country || sourceOrder?.country || sourceOrder?.provider_country || '').trim() || null,
+        String(details.phoneNumber || sourceOrder?.phone_number || sourceOrder?.provider_phone_number || '').trim() || null,
+        String(details.activationId || sourceOrder?.activation_id || '').trim() || null,
+        String(details.eventType || 'provider_security_event').trim() || 'provider_security_event',
+        String(details.reason || details.exploitReason || sourceOrder?.exploit_reason || '').trim() || null,
+        riskFlag,
+        lossDetected,
+        criticalExploit,
+        String(details.providerStatus || sourceOrder?.provider_status || sourceOrder?.provider_last_status || '').trim() || null,
+        String(details.providerFinalStatus || sourceOrder?.provider_final_status || '').trim() || null,
+        sourceOrder?.provider_balance_before == null ? null : Number(sourceOrder.provider_balance_before),
+        sourceOrder?.provider_balance_after == null ? null : Number(sourceOrder.provider_balance_after),
+        getRealProviderCostAmount(sourceOrder),
+        getWebsiteChargeAmount(sourceOrder),
+        getWebsiteRefundAmount(sourceOrder),
+        getRealProfitLossAmount(sourceOrder)
+    ]);
+    logProviderAudit('security_event_recorded', {
+        orderId: sourceOrder?.id ?? null,
+        userId: sourceOrder?.user_id ?? null,
+        eventType: String(details.eventType || 'provider_security_event').trim() || 'provider_security_event',
+        reason: String(details.reason || details.exploitReason || sourceOrder?.exploit_reason || '').trim() || null,
+        riskFlag,
+        lossDetected,
+        criticalExploit
+    });
+    return result.rows[0] || null;
+}
+
+async function getUserSecurityMetrics(userId, options = {}) {
+    const normalizedUserId = Number(userId);
+    if (!Number.isFinite(normalizedUserId) || normalizedUserId <= 0) return null;
+    const executor = options.client || pool;
+    const userRes = await executor.query('SELECT * FROM users WHERE id = $1 LIMIT 1', [normalizedUserId]);
+    const user = normalizeUser(userRes.rows[0]);
+    if (!user) return null;
+    const metricsRes = await executor.query(`
+        SELECT
+            COUNT(*) FILTER (
+                WHERE event_type = 'cancel_refund_completed'
+                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
+            )::int AS cancellations_last_hour,
+            COUNT(*) FILTER (
+                WHERE event_type IN ('cancel_refund_completed', 'expire_refund_completed')
+                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '1 day'
+            )::int AS refunds_today,
+            COUNT(*) FILTER (
+                WHERE risk_flag = TRUE
+                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+            )::int AS suspicious_recent,
+            COUNT(*) FILTER (
+                WHERE event_type = 'post_close_otp_poll'
+            )::int AS otp_after_cancel_attempts,
+            COUNT(*) FILTER (
+                WHERE reason IN (
+                    'otp_or_sms_refunded',
+                    'provider_cost_refunded',
+                    'provider_non_pending_refunded',
+                    'cancelled_after_provider_use'
+                )
+            )::int AS refund_abuse_count,
+            COUNT(*) FILTER (
+                WHERE critical_exploit = TRUE
+            )::int AS critical_total
+        FROM provider_security_events
+        WHERE user_id = $1
+    `, [normalizedUserId]);
+    const row = metricsRes.rows[0] || {};
+    const cancellationsLastHour = Number(row.cancellations_last_hour || 0);
+    const refundsToday = Number(row.refunds_today || 0);
+    const suspiciousRecent = Number(row.suspicious_recent || 0);
+    const otpAfterCancelAttempts = Number(row.otp_after_cancel_attempts || 0);
+    const refundAbuseCount = Number(row.refund_abuse_count || 0);
+    const criticalTotal = Number(row.critical_total || 0);
+    const riskScore = (
+        refundAbuseCount * 25
+        + otpAfterCancelAttempts * 20
+        + suspiciousRecent * 15
+        + criticalTotal * 50
+        + Math.max(0, cancellationsLastHour - SECURITY_MAX_CANCELLATIONS_PER_HOUR + 1) * 10
+        + Math.max(0, refundsToday - SECURITY_MAX_REFUNDS_PER_DAY + 1) * 10
+    );
+    return {
+        user,
+        cancellationsLastHour,
+        refundsToday,
+        suspiciousRecent,
+        otpAfterCancelAttempts,
+        refundAbuseCount,
+        criticalTotal,
+        riskScore,
+        riskStatus: calculateRiskStatus(riskScore)
+    };
+}
+
+async function syncUserSecurityState(userId, options = {}) {
+    const metrics = await getUserSecurityMetrics(userId, options);
+    if (!metrics) return null;
+    const executor = options.client || pool;
+    const now = new Date();
+    const existingBlockedUntil = metrics.user?.security_blocked_until ? new Date(metrics.user.security_blocked_until) : null;
+    let blockedUntil = existingBlockedUntil && existingBlockedUntil > now ? existingBlockedUntil : null;
+    if (metrics.criticalTotal > 0 || metrics.suspiciousRecent >= SECURITY_MAX_SUSPICIOUS_ACTIONS) {
+        blockedUntil = new Date(now.getTime() + SECURITY_AUTO_BLOCK_HOURS * 60 * 60 * 1000);
+    } else if (metrics.cancellationsLastHour >= SECURITY_MAX_CANCELLATIONS_PER_HOUR || metrics.refundsToday >= SECURITY_MAX_REFUNDS_PER_DAY) {
+        blockedUntil = new Date(now.getTime() + SECURITY_CANCEL_COOLDOWN_MINUTES * 60 * 1000);
+    }
+    const blockedUntilIso = blockedUntil ? blockedUntil.toISOString() : null;
+    const result = await executor.query(`
+        UPDATE users
+        SET security_risk_score = $1,
+            security_risk_status = $2,
+            security_blocked_until = $3,
+            security_last_flagged_at = CASE WHEN $1 > 0 THEN CURRENT_TIMESTAMP ELSE security_last_flagged_at END
+        WHERE id = $4
+        RETURNING *
+    `, [
+        metrics.riskScore,
+        metrics.riskStatus,
+        blockedUntilIso,
+        Number(userId)
+    ]);
+    return {
+        ...metrics,
+        user: normalizeUser(result.rows[0]),
+        blockedUntil: blockedUntilIso
+    };
+}
+
+async function syncOrderFinancialProtection(order, details = {}, options = {}) {
+    const normalizedOrder = normalizeOrder(order);
+    if (!normalizedOrder?.id) return null;
+    const derived = buildDerivedOrderMetrics(normalizedOrder, {
+        websiteCharge: details.websiteCharge,
+        websiteRefund: details.websiteRefund,
+        websiteProfit: details.websiteProfit,
+        realProviderCost: details.realProviderCost,
+        realProfitLoss: details.realProfitLoss,
+        providerStatus: details.providerStatus,
+        providerFinalStatus: details.providerFinalStatus,
+        providerUsed: details.providerUsed,
+        postClosePollCount: details.postClosePollCount
+    });
+    const updates = {
+        website_charge: derived.website_charge,
+        website_refund: derived.website_refund,
+        website_profit: derived.website_profit,
+        real_provider_cost: derived.real_provider_cost,
+        real_profit_loss: derived.real_profit_loss,
+        provider_status: derived.provider_status,
+        provider_final_status: derived.provider_final_status,
+        provider_used: derived.provider_used,
+        risk_flag: derived.riskState.riskFlag,
+        loss_detected: derived.riskState.lossDetected,
+        critical_exploit: derived.riskState.criticalExploit,
+        exploit_reason: derived.riskState.exploitReason,
+        exploit_reason_detail: derived.riskState.exploitReasonDetail,
+        post_close_poll_count: derived.post_close_poll_count,
+        refund_locked_at: derived.provider_used
+            ? (normalizedOrder.refund_locked_at || details.refundLockedAt || details.eventAt || new Date().toISOString())
+            : normalizedOrder.refund_locked_at || null
+    };
+    if (details.realProviderCostProviderCurrency !== undefined) {
+        updates.real_provider_cost_provider_currency = roundMoney(details.realProviderCostProviderCurrency || 0, 6);
+    }
+    if (details.providerCostSource !== undefined) {
+        updates.provider_cost_source = String(details.providerCostSource || '').trim() || null;
+    }
+    if (details.providerCostVerified !== undefined) {
+        updates.provider_cost_verified = Boolean(details.providerCostVerified);
+    }
+    if (details.providerBalanceBefore !== undefined) {
+        updates.provider_balance_before = details.providerBalanceBefore == null ? null : roundMoney(details.providerBalanceBefore, 6);
+    }
+    if (details.providerBalanceAfter !== undefined) {
+        updates.provider_balance_after = details.providerBalanceAfter == null ? null : roundMoney(details.providerBalanceAfter, 6);
+    }
+    if (details.providerBalanceCurrency !== undefined) {
+        updates.provider_balance_currency = String(details.providerBalanceCurrency || PROVIDER_BALANCE_CURRENCY).trim() || PROVIDER_BALANCE_CURRENCY;
+    }
+    if (details.providerPartnerId !== undefined) {
+        updates.provider_partner_id = details.providerPartnerId == null ? null : Number(details.providerPartnerId);
+    }
+    if (details.providerPriceUsd !== undefined) {
+        updates.provider_price_usd = details.providerPriceUsd == null ? 0 : roundMoney(details.providerPriceUsd, 6);
+    }
+    if (details.providerCountry !== undefined) {
+        updates.provider_country = String(details.providerCountry || '').trim() || null;
+    }
+    if (details.providerService !== undefined) {
+        updates.provider_service = String(details.providerService || '').trim() || null;
+    }
+    if (details.providerPhoneNumber !== undefined) {
+        updates.provider_phone_number = String(details.providerPhoneNumber || '').trim() || null;
+    }
+    if (details.providerStatusSyncedAt !== undefined) {
+        updates.provider_status_synced_at = details.providerStatusSyncedAt || null;
+    }
+    if (details.providerUsedAt !== undefined) {
+        updates.provider_used_at = details.providerUsedAt || null;
+    }
+    if (details.refundedAt !== undefined) {
+        updates.refunded_at = details.refundedAt || null;
+    }
+    if (details.usernameSnapshot !== undefined) {
+        updates.username_snapshot = String(details.usernameSnapshot || '').trim() || null;
+    }
+    const updatedOrder = await updateOrder(normalizedOrder.id, updates, {
+        client: options.client,
+        eventAt: details.eventAt,
+        otpReceivedAt: details.otpReceivedAt,
+        finalizedAt: details.finalizedAt,
+        syncNumberHistory: details.syncNumberHistory
+    });
+    const finalOrder = updatedOrder || normalizeOrder({ ...normalizedOrder, ...updates });
+    const shouldRecordEvent = Boolean(details.securityEventType)
+        || (details.recordRiskEvent !== false && finalOrder?.risk_flag);
+    if (shouldRecordEvent) {
+        await insertProviderSecurityEvent(finalOrder, {
+            eventType: details.securityEventType || (finalOrder?.critical_exploit ? 'critical_exploit_detected' : 'risk_flag_detected'),
+            reason: details.reason || finalOrder?.exploit_reason || null,
+            riskFlag: finalOrder?.risk_flag,
+            lossDetected: finalOrder?.loss_detected,
+            criticalExploit: finalOrder?.critical_exploit,
+            providerStatus: finalOrder?.provider_status,
+            providerFinalStatus: finalOrder?.provider_final_status
+        }, {
+            client: options.client
+        });
+    }
+    if (details.syncUserRisk !== false && finalOrder?.user_id != null) {
+        await syncUserSecurityState(finalOrder.user_id, { client: options.client });
+    }
+    return finalOrder;
+}
+
+async function registerClosedOrderAccess(order, details = {}, options = {}) {
+    const normalizedOrder = normalizeOrder(order);
+    if (!normalizedOrder?.id) return null;
+    const nextPollCount = Number(normalizedOrder.post_close_poll_count || 0) + 1;
+    const shouldFlag = nextPollCount >= SECURITY_POST_CLOSE_POLL_LIMIT;
+    return syncOrderFinancialProtection(normalizedOrder, {
+        postClosePollCount: nextPollCount,
+        securityEventType: details.eventType || 'post_close_otp_poll',
+        reason: shouldFlag ? 'multiple_refreshes_after_close' : String(details.reason || '').trim() || 'closed_order_access',
+        recordRiskEvent: shouldFlag,
+        syncNumberHistory: false,
+        syncUserRisk: shouldFlag,
+        eventAt: details.eventAt || new Date().toISOString()
+    }, options);
+}
+
+async function assertUserNotSecurityBlocked(userId, options = {}) {
+    const metrics = await syncUserSecurityState(userId, options);
+    if (!metrics?.user) {
+        throw new Error('User not found');
+    }
+    if (metrics.blockedUntil && new Date(metrics.blockedUntil) > new Date()) {
+        throw new Error('Account temporarily blocked due to suspicious activity. Please contact support.');
+    }
+    return metrics;
+}
+
+async function enforceCancelSecurityLimits(userId, order, options = {}) {
+    const metrics = await assertUserNotSecurityBlocked(userId, options);
+    if (metrics.cancellationsLastHour >= SECURITY_MAX_CANCELLATIONS_PER_HOUR) {
+        await insertProviderSecurityEvent(order, {
+            eventType: 'cancel_rate_limit_blocked',
+            reason: 'cancel_rate_limit_exceeded',
+            riskFlag: true,
+            lossDetected: false,
+            criticalExploit: false
+        }, {
+            client: options.client
+        });
+        await syncUserSecurityState(userId, options);
+        throw new Error(`Too many cancellations. Please wait ${SECURITY_CANCEL_COOLDOWN_MINUTES} minutes before trying again.`);
+    }
+    if (metrics.refundsToday >= SECURITY_MAX_REFUNDS_PER_DAY) {
+        await insertProviderSecurityEvent(order, {
+            eventType: 'refund_rate_limit_blocked',
+            reason: 'refund_rate_limit_exceeded',
+            riskFlag: true,
+            lossDetected: false,
+            criticalExploit: false
+        }, {
+            client: options.client
+        });
+        await syncUserSecurityState(userId, options);
+        throw new Error('Refund limit reached for today. Please contact support if this is unexpected.');
+    }
+    return metrics;
+}
+
 async function updateProviderActivationStatus(activationId, status) {
     if (!activationId) return { success: false, skipped: true };
     try {
         const url = `${SMSBOWER_URL}?api_key=${SMSBOWER_API_KEY}&action=setStatus&id=${activationId}&status=${status}`;
-        await axios.get(url, { timeout: 15000 });
-        return { success: true };
+        const response = await axios.get(url, { timeout: 15000 });
+        return {
+            success: true,
+            raw: typeof response?.data === 'string' ? response.data.trim() : String(response?.data || '').trim() || null
+        };
     } catch (err) {
         return { success: false, error: err.message };
     }
@@ -1823,6 +2625,7 @@ function analyzeProviderSmsResult(result) {
             providerPending: false,
             providerReportedNonPending: true,
             providerValidationFailed: false,
+            providerCancelled: false,
             providerError: null
         };
     }
@@ -1834,6 +2637,19 @@ function analyzeProviderSmsResult(result) {
             providerPending: true,
             providerReportedNonPending: false,
             providerValidationFailed: false,
+            providerCancelled: false,
+            providerError: null
+        };
+    }
+    if (normalizedRawStatus === 'ACCESS_CANCEL' || normalizedRawStatus === 'STATUS_CANCEL') {
+        return {
+            rawStatus,
+            code: '',
+            hasCode: false,
+            providerPending: false,
+            providerReportedNonPending: false,
+            providerValidationFailed: false,
+            providerCancelled: true,
             providerError: null
         };
     }
@@ -1845,6 +2661,7 @@ function analyzeProviderSmsResult(result) {
             providerPending: false,
             providerReportedNonPending: true,
             providerValidationFailed: false,
+            providerCancelled: false,
             providerError: null
         };
     }
@@ -1855,6 +2672,7 @@ function analyzeProviderSmsResult(result) {
         providerPending: false,
         providerReportedNonPending: false,
         providerValidationFailed: true,
+        providerCancelled: false,
         providerError: String(result?.error || '').trim() || 'Provider status unavailable'
     };
 }
@@ -1867,7 +2685,13 @@ async function syncOrderWithProviderSignal(order, providerSignal, options = {}) 
     const updates = {
         sms_received: true,
         sms_received_at: eventAt,
-        provider_last_status: providerSignal.rawStatus || String(order.provider_last_status || '').trim() || null
+        provider_last_status: providerSignal.rawStatus || String(order.provider_last_status || '').trim() || null,
+        provider_status: providerSignal.rawStatus || String(order.provider_status || order.provider_last_status || '').trim() || null,
+        provider_final_status: providerSignal.rawStatus || String(order.provider_final_status || '').trim() || null,
+        provider_status_synced_at: eventAt,
+        provider_used: true,
+        provider_used_at: order.provider_used_at || eventAt,
+        refund_locked_at: order.refund_locked_at || eventAt
     };
     if (providerSignal.hasCode) {
         updates.otp_received = true;
@@ -1875,12 +2699,30 @@ async function syncOrderWithProviderSignal(order, providerSignal, options = {}) 
         updates.order_status = 'active';
         updates.status = 'active';
     }
-    return updateOrder(order.id, updates, {
+    const updatedOrder = await updateOrder(order.id, updates, {
         client: options.client,
         eventAt,
         otpReceivedAt: providerSignal.hasCode ? eventAt : options.otpReceivedAt,
         finalizedAt: options.finalizedAt,
         syncNumberHistory: options.syncNumberHistory
+    });
+    return syncOrderFinancialProtection(updatedOrder, {
+        providerStatus: updates.provider_status,
+        providerFinalStatus: updates.provider_final_status,
+        providerUsed: true,
+        providerUsedAt: updates.provider_used_at,
+        providerStatusSyncedAt: eventAt,
+        refundLockedAt: updates.refund_locked_at,
+        securityEventType: providerSignal.hasCode ? 'provider_otp_received' : 'provider_sms_received',
+        reason: providerSignal.hasCode ? 'provider_code_received' : 'provider_status_changed',
+        recordRiskEvent: false,
+        syncUserRisk: false,
+        syncNumberHistory: false,
+        eventAt,
+        otpReceivedAt: providerSignal.hasCode ? eventAt : options.otpReceivedAt,
+        finalizedAt: options.finalizedAt
+    }, {
+        client: options.client
     });
 }
 
@@ -1899,9 +2741,11 @@ async function expireOrderAndRefund(orderId) {
             return {
                 found: true,
                 expired: true,
-                refunded: true,
+                refunded: getWebsiteRefundAmount(order) > 0,
                 order: normalizeOrder(order),
-                message: EXPIRED_REFUND_MESSAGE
+                message: getWebsiteRefundAmount(order) > 0
+                    ? EXPIRED_REFUND_MESSAGE
+                    : 'Order expired, but refund is blocked until provider cost is cleared.'
             };
         }
         const expiry = order.expires_at ? new Date(order.expires_at) : null;
@@ -1970,33 +2814,110 @@ async function expireOrderAndRefund(orderId) {
         }
         const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [order.user_id]);
         const user = userRes.rows[0] || null;
-        await updateProviderActivationStatus(order.activation_id, 8);
-        if (user) {
+        const providerBalanceBaselineForExpire = await getProviderBalance();
+        const expireCancelResult = await updateProviderActivationStatus(order.activation_id, 8);
+        const providerBalanceAfterExpire = await getProviderBalance();
+        const providerRecovery = computeProviderRefundRecoveryMetrics(order, {
+            balanceBeforeAction: providerBalanceBaselineForExpire.success
+                ? providerBalanceBaselineForExpire.balance
+                : (order.provider_balance_after == null ? null : Number(order.provider_balance_after)),
+            balanceAfterAction: providerBalanceAfterExpire.success
+                ? providerBalanceAfterExpire.balance
+                : null
+        });
+        const previousProviderCostCurrency = roundMoney(order.real_provider_cost_provider_currency || 0, 6);
+        const providerRefundVerified = !order.activation_id
+            || (providerRecovery.balanceVerified && expireCancelResult.success);
+        const remainingProviderCostCurrency = providerRefundVerified
+            ? providerRecovery.remainingCurrency
+            : previousProviderCostCurrency;
+        const remainingProviderCostPkr = providerRefundVerified
+            ? providerRecovery.remainingPkr
+            : getRealProviderCostAmount(order);
+        const refundAllowed = providerRefundVerified && remainingProviderCostCurrency <= PROVIDER_BALANCE_EPSILON;
+        const walletRefundAmount = refundAllowed && user ? Number(order.price || 0) : 0;
+        if (walletRefundAmount > 0 && user) {
             await client.query('UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2', [
-                Number(order.price || 0),
+                walletRefundAmount,
                 user.id
             ]);
         }
         const expiredAt = refundTime;
-        const updatedOrder = await updateOrder(order.id, {
+        const expiredOrder = await updateOrder(order.id, {
             order_status: 'expired',
-            status: 'expired'
+            status: 'expired',
+            provider_last_status: expireCancelResult.raw || order.provider_last_status || null
         }, {
             client,
             eventAt: expiredAt,
-            finalizedAt: expiredAt
+            finalizedAt: expiredAt,
+            syncNumberHistory: false
         });
+        const updatedOrder = await syncOrderFinancialProtection(expiredOrder, {
+            websiteCharge: Number(order.price || 0),
+            websiteRefund: walletRefundAmount,
+            websiteProfit: roundMoney(Number(order.price || 0) - walletRefundAmount),
+            realProviderCost: remainingProviderCostPkr,
+            realProviderCostProviderCurrency: remainingProviderCostCurrency,
+            providerCostVerified: providerRefundVerified || Boolean(order.provider_cost_verified),
+            providerCostSource: providerRefundVerified ? 'expire_balance_reconciliation' : order.provider_cost_source,
+            providerBalanceAfter: providerBalanceAfterExpire.success
+                ? providerBalanceAfterExpire.balance
+                : order.provider_balance_after,
+            providerBalanceCurrency: providerBalanceAfterExpire.currency || order.provider_balance_currency || PROVIDER_BALANCE_CURRENCY,
+            providerStatus: expireCancelResult.raw || order.provider_status || order.provider_last_status || null,
+            providerFinalStatus: expireCancelResult.raw || order.provider_final_status || null,
+            providerStatusSyncedAt: expiredAt,
+            providerUsed: isProviderUsedOrder(order),
+            refundedAt: walletRefundAmount > 0 ? expiredAt : null,
+            securityEventType: walletRefundAmount > 0 ? 'expire_refund_completed' : 'expire_refund_blocked_provider_cost',
+            reason: walletRefundAmount > 0
+                ? 'order_expired'
+                : (!expireCancelResult.success
+                    ? 'provider_expire_verification_failed'
+                    : 'provider_balance_cost_remaining'),
+            recordRiskEvent: walletRefundAmount <= 0,
+            syncNumberHistory: true,
+            syncUserRisk: walletRefundAmount <= 0,
+            eventAt: expiredAt,
+            finalizedAt: expiredAt
+        }, {
+            client
+        });
+        if (providerBalanceAfterExpire.success) {
+            await insertProviderBalanceSnapshot({
+                orderId: updatedOrder?.id || order.id,
+                userId: order.user_id,
+                activationId: order.activation_id,
+                reason: walletRefundAmount > 0 ? 'order_expire_after' : 'order_expire_after_blocked',
+                providerBalance: providerBalanceAfterExpire.balance,
+                previousBalance: providerBalanceBaselineForExpire.success
+                    ? providerBalanceBaselineForExpire.balance
+                    : (order.provider_balance_after == null ? null : Number(order.provider_balance_after)),
+                expectedSpendPkr: remainingProviderCostPkr,
+                note: expireCancelResult.raw || (walletRefundAmount > 0 ? 'order_expire' : 'expire_refund_blocked')
+            }, {
+                client
+            });
+        }
         await client.query('COMMIT');
-        logOrderHotfixEvent('refund_completed_expired_order', updatedOrder, {
+        logOrderHotfixEvent(walletRefundAmount > 0 ? 'refund_completed_expired_order' : 'refund_blocked_expired_provider_cost', updatedOrder, {
             refundTime: expiredAt,
-            reason: 'order_expired'
+            providerStatus: expireCancelResult.raw || null,
+            reason: walletRefundAmount > 0
+                ? 'order_expired'
+                : (!expireCancelResult.success ? 'provider_expire_verification_failed' : 'provider_balance_cost_remaining')
         });
         return {
             found: true,
             expired: true,
-            refunded: Boolean(user),
+            refunded: walletRefundAmount > 0,
             order: updatedOrder,
-            message: EXPIRED_REFUND_MESSAGE
+            message: walletRefundAmount > 0
+                ? EXPIRED_REFUND_MESSAGE
+                : (!expireCancelResult.success
+                    ? 'Order expired, but refund is blocked because provider cancellation could not be verified.'
+                    : 'Order expired, but refund is blocked because provider cost is still charged.')
         };
     } catch (err) {
         await client.query('ROLLBACK');
@@ -2030,15 +2951,250 @@ async function getAllOrders() {
             COALESCE(u.email, o.user_email) AS user_email,
             COALESCE(u.balance, 0) AS client_balance_left,
             CASE
+                WHEN o.real_profit_loss IS NOT NULL
+                    THEN ROUND(COALESCE(o.real_profit_loss, 0)::numeric, 2)
                 WHEN COALESCE(o.provider_cost_pkr, 0) > 0
                     THEN ROUND((COALESCE(o.price, 0) - COALESCE(o.provider_cost_pkr, 0))::numeric, 2)
-                ELSE NULL
+                ELSE ROUND((COALESCE(o.price, 0) - COALESCE(o.website_refund, 0))::numeric, 2)
             END AS profit_pkr
         FROM orders o
         LEFT JOIN users u ON u.id = o.user_id
         ORDER BY o.id DESC
     `);
     return rows.map(normalizeOrder);
+}
+
+function normalizeProviderBalanceSnapshotEntry(row) {
+    if (!row) return null;
+    return {
+        ...row,
+        order_id: row.order_id == null ? null : Number(row.order_id),
+        user_id: row.user_id == null ? null : Number(row.user_id),
+        provider_balance: row.provider_balance == null ? null : Number(row.provider_balance),
+        previous_balance: row.previous_balance == null ? null : Number(row.previous_balance),
+        delta: row.delta == null ? null : Number(row.delta),
+        delta_pkr: Number(row.delta_pkr || 0),
+        expected_spend_pkr: Number(row.expected_spend_pkr || 0),
+        unmatched_delta_pkr: Number(row.unmatched_delta_pkr || 0),
+        anomaly_flag: Boolean(row.anomaly_flag)
+    };
+}
+
+function normalizeProviderSecurityEventEntry(row) {
+    if (!row) return null;
+    return {
+        ...row,
+        order_id: row.order_id == null ? null : Number(row.order_id),
+        user_id: row.user_id == null ? null : Number(row.user_id),
+        risk_flag: Boolean(row.risk_flag),
+        loss_detected: Boolean(row.loss_detected),
+        critical_exploit: Boolean(row.critical_exploit),
+        provider_balance_before: row.provider_balance_before == null ? null : Number(row.provider_balance_before),
+        provider_balance_after: row.provider_balance_after == null ? null : Number(row.provider_balance_after),
+        real_provider_cost: Number(row.real_provider_cost || 0),
+        website_charge: Number(row.website_charge || 0),
+        website_refund: Number(row.website_refund || 0),
+        real_profit_loss: Number(row.real_profit_loss || 0)
+    };
+}
+
+async function getAdminProviderAnalytics(options = {}) {
+    const snapshotLimit = Math.max(5, Math.min(100, Number(options.snapshotLimit || 20)));
+    const eventLimit = Math.max(5, Math.min(100, Number(options.eventLimit || 25)));
+    const topRiskUserLimit = Math.max(5, Math.min(50, Number(options.topRiskUserLimit || 15)));
+    const [orderSummaryRow, userSummaryRow, latestSnapshotRow, serviceBreakdownRows, recentSnapshotRows, recentEventRows, topRiskUserRows] = await Promise.all([
+        queryOne(`
+            SELECT
+                COUNT(*)::int AS total_orders,
+                COUNT(*) FILTER (WHERE provider_used = TRUE)::int AS provider_used_orders,
+                COUNT(*) FILTER (WHERE risk_flag = TRUE)::int AS risk_orders,
+                COUNT(*) FILTER (WHERE loss_detected = TRUE)::int AS loss_orders,
+                COUNT(*) FILTER (WHERE critical_exploit = TRUE)::int AS critical_orders,
+                COUNT(*) FILTER (WHERE website_refund > 0)::int AS refunded_orders,
+                COALESCE(SUM(website_charge), 0)::numeric AS total_website_charge,
+                COALESCE(SUM(website_refund), 0)::numeric AS total_website_refund,
+                COALESCE(SUM(website_profit), 0)::numeric AS total_website_profit,
+                COALESCE(SUM(real_provider_cost), 0)::numeric AS total_real_provider_cost,
+                COALESCE(SUM(real_profit_loss), 0)::numeric AS total_real_profit_loss
+            FROM orders
+        `),
+        queryOne(`
+            SELECT
+                COUNT(*) FILTER (WHERE security_risk_status <> 'safe')::int AS risky_users,
+                COUNT(*) FILTER (WHERE security_blocked_until > CURRENT_TIMESTAMP)::int AS blocked_users,
+                COALESCE(MAX(security_risk_score), 0)::numeric AS max_risk_score
+            FROM users
+        `),
+        queryOne(`
+            SELECT *
+            FROM provider_balance_snapshots
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        `),
+        queryAll(`
+            SELECT
+                COALESCE(provider_service, service_type, 'unknown') AS provider_service,
+                COUNT(*)::int AS total_orders,
+                COUNT(*) FILTER (WHERE risk_flag = TRUE)::int AS risk_orders,
+                COALESCE(SUM(real_provider_cost), 0)::numeric AS total_real_provider_cost,
+                COALESCE(SUM(real_profit_loss), 0)::numeric AS total_real_profit_loss
+            FROM orders
+            GROUP BY COALESCE(provider_service, service_type, 'unknown')
+            ORDER BY total_real_provider_cost DESC, total_orders DESC
+            LIMIT 10
+        `),
+        queryAll(`
+            SELECT *
+            FROM provider_balance_snapshots
+            ORDER BY created_at DESC, id DESC
+            LIMIT $1
+        `, [snapshotLimit]),
+        queryAll(`
+            SELECT *
+            FROM provider_security_events
+            ORDER BY created_at DESC, id DESC
+            LIMIT $1
+        `, [eventLimit]),
+        queryAll(`
+            SELECT
+                id,
+                name,
+                email,
+                balance,
+                security_risk_score,
+                security_risk_status,
+                security_blocked_until,
+                security_last_flagged_at
+            FROM users
+            WHERE COALESCE(security_risk_score, 0) > 0
+               OR security_blocked_until > CURRENT_TIMESTAMP
+               OR COALESCE(security_risk_status, 'safe') <> 'safe'
+            ORDER BY COALESCE(security_risk_score, 0) DESC, security_blocked_until DESC NULLS LAST, id DESC
+            LIMIT $1
+        `, [topRiskUserLimit])
+    ]);
+
+    const latestSnapshot = normalizeProviderBalanceSnapshotEntry(latestSnapshotRow);
+    return {
+        summary: {
+            totalOrders: Number(orderSummaryRow?.total_orders || 0),
+            providerUsedOrders: Number(orderSummaryRow?.provider_used_orders || 0),
+            riskOrders: Number(orderSummaryRow?.risk_orders || 0),
+            lossOrders: Number(orderSummaryRow?.loss_orders || 0),
+            criticalOrders: Number(orderSummaryRow?.critical_orders || 0),
+            refundedOrders: Number(orderSummaryRow?.refunded_orders || 0),
+            totalWebsiteCharge: Number(orderSummaryRow?.total_website_charge || 0),
+            totalWebsiteRefund: Number(orderSummaryRow?.total_website_refund || 0),
+            totalWebsiteProfit: Number(orderSummaryRow?.total_website_profit || 0),
+            totalRealProviderCost: Number(orderSummaryRow?.total_real_provider_cost || 0),
+            totalRealProfitLoss: Number(orderSummaryRow?.total_real_profit_loss || 0),
+            riskyUsers: Number(userSummaryRow?.risky_users || 0),
+            blockedUsers: Number(userSummaryRow?.blocked_users || 0),
+            maxRiskScore: Number(userSummaryRow?.max_risk_score || 0),
+            latestProviderBalance: latestSnapshot?.provider_balance ?? null,
+            latestProviderBalanceCurrency: latestSnapshot?.provider_balance == null ? PROVIDER_BALANCE_CURRENCY : (latestSnapshot?.provider_balance_currency || PROVIDER_BALANCE_CURRENCY),
+            latestReconciliationAt: latestSnapshot?.created_at || null,
+            latestReconciliationReason: latestSnapshot?.reason || null,
+            latestUnmatchedDeltaPkr: latestSnapshot?.unmatched_delta_pkr || 0,
+            latestAnomalyFlag: Boolean(latestSnapshot?.anomaly_flag)
+        },
+        serviceBreakdown: serviceBreakdownRows.map((row) => ({
+            provider_service: String(row.provider_service || 'unknown').trim() || 'unknown',
+            total_orders: Number(row.total_orders || 0),
+            risk_orders: Number(row.risk_orders || 0),
+            total_real_provider_cost: Number(row.total_real_provider_cost || 0),
+            total_real_profit_loss: Number(row.total_real_profit_loss || 0)
+        })),
+        recentBalanceSnapshots: recentSnapshotRows.map(normalizeProviderBalanceSnapshotEntry),
+        recentSecurityEvents: recentEventRows.map(normalizeProviderSecurityEventEntry),
+        topRiskUsers: topRiskUserRows.map(normalizeUser)
+    };
+}
+
+let providerReconciliationTimer = null;
+let providerReconciliationRunning = false;
+
+async function runProviderBalanceReconciliation(reason = 'scheduled_reconciliation') {
+    if (providerReconciliationRunning) {
+        return { success: false, skipped: true, reason: 'already_running' };
+    }
+    providerReconciliationRunning = true;
+    try {
+        const providerBalance = await getProviderBalance();
+        if (!providerBalance.success) {
+            logProviderAudit('reconciliation_failed', {
+                reason,
+                error: providerBalance.error || 'Provider balance unavailable'
+            });
+            return { success: false, error: providerBalance.error || 'Provider balance unavailable' };
+        }
+
+        const latestSnapshot = await getLatestProviderBalanceSnapshot();
+        const lastReconciliationSnapshot = await getLastProviderReconciliationSnapshot();
+        const expectedDeltaRow = lastReconciliationSnapshot?.created_at
+            ? await queryOne(`
+                SELECT COALESCE(SUM(delta_pkr), 0)::numeric AS expected_delta_pkr
+                FROM provider_balance_snapshots
+                WHERE created_at > $1
+                  AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+            `, [lastReconciliationSnapshot.created_at])
+            : { expected_delta_pkr: 0 };
+        const previousBalance = latestSnapshot?.provider_balance == null ? null : Number(latestSnapshot.provider_balance);
+        const actualDelta = previousBalance == null
+            ? null
+            : roundMoney(previousBalance - providerBalance.balance, 6);
+        const actualDeltaPkr = actualDelta == null ? 0 : usdToPkr(actualDelta);
+        const expectedDeltaPkr = Number(expectedDeltaRow?.expected_delta_pkr || 0);
+        const unmatchedDeltaPkr = roundMoney(actualDeltaPkr - expectedDeltaPkr, 2);
+        const anomalyFlag = actualDelta != null && Math.abs(unmatchedDeltaPkr) > Math.max(50, Math.abs(actualDeltaPkr) * 0.35);
+        const snapshot = await insertProviderBalanceSnapshot({
+            reason,
+            providerBalance: providerBalance.balance,
+            previousBalance,
+            expectedSpendPkr: expectedDeltaPkr,
+            unmatchedDeltaPkr,
+            anomalyFlag,
+            note: anomalyFlag
+                ? `Provider reconciliation mismatch detected (${unmatchedDeltaPkr} PKR).`
+                : 'Provider balance reconciliation completed.'
+        });
+        if (anomalyFlag) {
+            await insertProviderSecurityEvent(null, {
+                eventType: 'provider_reconciliation_anomaly',
+                reason: 'provider_balance_reconciliation_mismatch',
+                riskFlag: true,
+                lossDetected: false,
+                criticalExploit: false,
+                providerStatus: null,
+                providerFinalStatus: null
+            });
+        }
+        return {
+            success: true,
+            snapshot: normalizeProviderBalanceSnapshotEntry(snapshot),
+            unmatchedDeltaPkr,
+            anomalyFlag
+        };
+    } catch (err) {
+        logProviderAudit('reconciliation_failed', {
+            reason,
+            error: formatSafeError(err, 'Provider reconciliation failed')
+        });
+        return { success: false, error: formatSafeError(err, 'Provider reconciliation failed') };
+    } finally {
+        providerReconciliationRunning = false;
+    }
+}
+
+function startProviderReconciliationLoop() {
+    if (providerReconciliationTimer) {
+        clearInterval(providerReconciliationTimer);
+        providerReconciliationTimer = null;
+    }
+    void runProviderBalanceReconciliation('startup_reconciliation');
+    providerReconciliationTimer = setInterval(() => {
+        void runProviderBalanceReconciliation('scheduled_reconciliation');
+    }, PROVIDER_RECONCILIATION_INTERVAL_MS);
 }
 
 async function updateUserLoginAttempts(userId, attempts) {
@@ -7801,7 +8957,12 @@ function parseNumberResponse(data) {
                 activationId: String(data.activationId),
                 phoneNumber: String(data.phoneNumber).startsWith('+')
                     ? String(data.phoneNumber)
-                    : `+${String(data.phoneNumber)}`
+                    : `+${String(data.phoneNumber)}`,
+                activationCost: data.activationCost == null ? null : Number(data.activationCost),
+                countryCode: String(data.countryCode || '').trim() || null,
+                activationOperator: String(data.activationOperator || '').trim() || null,
+                activationTime: data.activationTime || null,
+                canGetAnotherSms: Boolean(data.canGetAnotherSms)
             };
         }
     }
@@ -7872,7 +9033,12 @@ async function buyNumberFromProvider(countryId, provider, serviceCode = 'wa') {
             return {
                 ...parsed,
                 provider_id: provider.provider_id,
-                provider_price: provider.price
+                provider_price: provider.price,
+                activationCost: parsed.activationCost,
+                countryCode: parsed.countryCode,
+                activationOperator: parsed.activationOperator,
+                activationTime: parsed.activationTime,
+                canGetAnotherSms: parsed.canGetAnotherSms
             };
         }
         return { success: false, error: parsed.error || 'No number from provider' };
@@ -7906,7 +9072,12 @@ async function buyNumberByTierStrategy(countryId, clientMaxUsd, serviceCode = 'w
                         phoneNumber: result.phoneNumber,
                         strategy: 'provider',
                         provider_id: result.provider_id,
-                        provider_price: result.provider_price
+                        provider_price: result.provider_price,
+                        activationCost: result.activationCost,
+                        countryCode: result.countryCode,
+                        activationOperator: result.activationOperator,
+                        activationTime: result.activationTime,
+                        canGetAnotherSms: result.canGetAnotherSms
                     };
                 }
                 lastError = result.error || lastError;
@@ -7946,7 +9117,12 @@ async function buyNumberWithRetry(countryId, baseUsdPrice, maxAttempts = 3, serv
                     success: true,
                     activationId: parsed.activationId,
                     phoneNumber: parsed.phoneNumber,
-                    strategy: 'fallback'
+                    strategy: 'fallback',
+                    activationCost: parsed.activationCost,
+                    countryCode: parsed.countryCode,
+                    activationOperator: parsed.activationOperator,
+                    activationTime: parsed.activationTime,
+                    canGetAnotherSms: parsed.canGetAnotherSms
                 };
             }
             if (attempt < maxAttempts) {
@@ -8201,6 +9377,15 @@ app.get('/api/admin/referrals', ensureAdmin, async (_req, res) => {
     }
 });
 
+app.get('/api/admin/provider-analytics', ensureAdmin, async (_req, res) => {
+    try {
+        const analytics = await getAdminProviderAnalytics();
+        res.json(analytics);
+    } catch (err) {
+        res.status(500).send(formatSafeError(err, 'Provider analytics unavailable'));
+    }
+});
+
 app.post('/api/reset-password', async (req, res) => {
     try {
         const token = String(req.body.token || '').trim();
@@ -8375,14 +9560,23 @@ app.post('/api/order', ensureAuth, async (req, res) => {
             return res.status(400).send('Price not configured for selected service');
         }
 
+        await assertUserNotSecurityBlocked(req.session.userId);
         const clientMaxUsd = pkrToUsd(orderPrice);
+        const latestProviderSnapshot = await getLatestProviderBalanceSnapshot();
+        const providerBalanceBeforePurchase = await getProviderBalance();
         const result = await getBestAvailableNumber(countryObj.countryId, clientMaxUsd, serviceConfig.serviceCode);
         if (!result.success) {
             return res.status(500).send('Number not available yet, please try again later');
         }
         activationToRelease = result.activationId || null;
-
-        const providerCostPKR = Number((Number(result.provider_price || 0) * 280).toFixed(2));
+        const providerBalanceAfterPurchase = await getProviderBalance();
+        const providerCostMetrics = computeProviderCostMetrics({
+            balanceBefore: providerBalanceBeforePurchase.success ? providerBalanceBeforePurchase.balance : null,
+            balanceAfter: providerBalanceAfterPurchase.success ? providerBalanceAfterPurchase.balance : null,
+            activationCost: result.activationCost,
+            providerPrice: result.provider_price
+        });
+        const providerCostPKR = providerCostMetrics.providerCostPkr;
         const now = new Date();
         const expiresAt = new Date(now.getTime() + 25 * 60 * 1000).toISOString();
         const cancelAvailableAt = new Date(now.getTime() + 17 * 1000).toISOString();
@@ -8394,6 +9588,7 @@ app.post('/api/order', ensureAuth, async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(401).send('User not found');
         }
+        await assertUserNotSecurityBlocked(user.id, { client });
 
         const existingByIdempotency = await client.query(
             'SELECT id, phone_number FROM orders WHERE user_id = $1 AND idempotency_key = $2 ORDER BY id DESC LIMIT 1',
@@ -8436,9 +9631,9 @@ app.post('/api/order', ensureAuth, async (req, res) => {
         const inserted = await client.query(`
             INSERT INTO orders (
                 user_id, user_email, service_type, service_name, country, country_code, country_id, price, provider_cost_pkr,
-                payment_method, order_status, status, phone_number, activation_id,
+                payment_method, order_status, status, phone_number, activation_id, username_snapshot,
                 expires_at, cancel_available_at, last_purchase_at, idempotency_key, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             RETURNING *
         `, [
             user.id,
@@ -8455,23 +9650,63 @@ app.post('/api/order', ensureAuth, async (req, res) => {
             'pending',
             result.phoneNumber,
             result.activationId,
+            user.name,
             expiresAt,
             cancelAvailableAt,
             now.toISOString(),
             idempotencyKey,
             now.toISOString()
         ]);
-        await upsertNumberHistoryFromOrder(inserted.rows[0], {
-            client,
+        const createdOrder = await syncOrderFinancialProtection(inserted.rows[0], {
+            websiteCharge: orderPrice,
+            websiteRefund: 0,
+            websiteProfit: orderPrice,
+            realProviderCost: providerCostMetrics.providerCostPkr,
+            realProviderCostProviderCurrency: providerCostMetrics.providerCurrencyCost,
+            providerCostSource: providerCostMetrics.costSource,
+            providerCostVerified: providerCostMetrics.costSource != null,
+            providerBalanceBefore: providerBalanceBeforePurchase.success ? providerBalanceBeforePurchase.balance : null,
+            providerBalanceAfter: providerBalanceAfterPurchase.success ? providerBalanceAfterPurchase.balance : null,
+            providerBalanceCurrency: providerBalanceAfterPurchase.currency || providerBalanceBeforePurchase.currency || PROVIDER_BALANCE_CURRENCY,
+            providerPartnerId: result.provider_id || null,
+            providerPriceUsd: result.provider_price || result.activationCost || 0,
+            providerStatus: ORDER_PROVIDER_WAITING_STATUS,
+            providerFinalStatus: null,
+            providerCountry: countryName,
+            providerService: serviceConfig.serviceCode,
+            providerPhoneNumber: result.phoneNumber,
+            providerStatusSyncedAt: now.toISOString(),
+            usernameSnapshot: user.name,
+            syncNumberHistory: true,
+            syncUserRisk: false,
+            recordRiskEvent: false,
             eventAt: now.toISOString()
+        }, {
+            client
         });
+        if (providerBalanceAfterPurchase.success) {
+            await insertProviderBalanceSnapshot({
+                orderId: createdOrder?.id || inserted.rows[0]?.id,
+                userId: user.id,
+                activationId: result.activationId,
+                reason: 'order_purchase_after',
+                providerBalance: providerBalanceAfterPurchase.balance,
+                previousBalance: providerBalanceBeforePurchase.success
+                    ? providerBalanceBeforePurchase.balance
+                    : (latestProviderSnapshot?.provider_balance == null ? null : Number(latestProviderSnapshot.provider_balance)),
+                expectedSpendPkr: providerCostMetrics.providerCostPkr,
+                note: providerCostMetrics.costSource || 'order_purchase'
+            }, {
+                client
+            });
+        }
         await client.query(
             'INSERT INTO transactions (user_id, user_email, amount, type, status, description) VALUES ($1, $2, $3, $4, $5, $6)',
             [user.id, user.email, orderPrice, 'deduction', 'approved', `${serviceConfig.serviceName} • ${countryName}`]
         );
         await client.query('COMMIT');
         activationToRelease = null;
-        res.json({ id: inserted.rows[0].id, number: result.phoneNumber });
+        res.json({ id: createdOrder?.id || inserted.rows[0].id, number: result.phoneNumber });
     } catch (err) {
         try {
             await client.query('ROLLBACK');
@@ -8550,6 +9785,7 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(403).send('Unauthorized');
         }
+        await enforceCancelSecurityLimits(user.id, order, { client });
         if (isFinalOrderState(order) || normalizeOrderStatus(order) !== 'pending') {
             await client.query('ROLLBACK');
             return res.status(400).send('Cannot cancel now');
@@ -8604,30 +9840,106 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).send(`Please wait ${Math.ceil((cancelAvailable - now) / 1000)} seconds before cancelling.`);
         }
-        try {
-            const cancelUrl = `${SMSBOWER_URL}?api_key=${SMSBOWER_API_KEY}&action=setStatus&id=${order.activation_id}&status=8`;
-            await axios.get(cancelUrl, { timeout: 15000 });
-        } catch {}
-        await client.query('UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2', [
-            Number(order.price || 0),
-            user.id
-        ]);
+        const providerBalanceBaselineForCancel = await getProviderBalance();
+        const cancelResult = await updateProviderActivationStatus(order.activation_id, 8);
+        const providerBalanceAfterCancel = await getProviderBalance();
+        const providerRecovery = computeProviderRefundRecoveryMetrics(order, {
+            balanceBeforeAction: providerBalanceBaselineForCancel.success
+                ? providerBalanceBaselineForCancel.balance
+                : (order.provider_balance_after == null ? null : Number(order.provider_balance_after)),
+            balanceAfterAction: providerBalanceAfterCancel.success
+                ? providerBalanceAfterCancel.balance
+                : null
+        });
+        const previousProviderCostCurrency = roundMoney(order.real_provider_cost_provider_currency || 0, 6);
+        const providerRefundVerified = !order.activation_id
+            || (providerRecovery.balanceVerified && cancelResult.success);
+        const remainingProviderCostCurrency = providerRefundVerified
+            ? providerRecovery.remainingCurrency
+            : previousProviderCostCurrency;
+        const remainingProviderCostPkr = providerRefundVerified
+            ? providerRecovery.remainingPkr
+            : getRealProviderCostAmount(order);
+        const refundAllowed = providerRefundVerified && remainingProviderCostCurrency <= PROVIDER_BALANCE_EPSILON;
+        const walletRefundAmount = refundAllowed ? Number(order.price || 0) : 0;
+        if (walletRefundAmount > 0) {
+            await client.query('UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2', [
+                walletRefundAmount,
+                user.id
+            ]);
+        }
         const cancelledAt = cancelTime;
-        const updatedOrder = await updateOrder(order.id, {
+        const cancelledOrder = await updateOrder(order.id, {
             order_status: 'cancelled',
-            status: 'cancelled'
+            status: 'cancelled',
+            provider_last_status: cancelResult.raw || order.provider_last_status || null
         }, {
             client,
             eventAt: cancelledAt,
+            finalizedAt: cancelledAt,
+            syncNumberHistory: false
+        });
+        const updatedOrder = await syncOrderFinancialProtection(cancelledOrder, {
+            websiteCharge: Number(order.price || 0),
+            websiteRefund: walletRefundAmount,
+            websiteProfit: roundMoney(Number(order.price || 0) - walletRefundAmount),
+            realProviderCost: remainingProviderCostPkr,
+            realProviderCostProviderCurrency: remainingProviderCostCurrency,
+            providerCostVerified: providerRefundVerified || Boolean(order.provider_cost_verified),
+            providerCostSource: providerRefundVerified ? 'cancel_balance_reconciliation' : order.provider_cost_source,
+            providerBalanceAfter: providerBalanceAfterCancel.success
+                ? providerBalanceAfterCancel.balance
+                : order.provider_balance_after,
+            providerBalanceCurrency: providerBalanceAfterCancel.currency || order.provider_balance_currency || PROVIDER_BALANCE_CURRENCY,
+            providerStatus: cancelResult.raw || order.provider_status || order.provider_last_status || null,
+            providerFinalStatus: cancelResult.raw || order.provider_final_status || null,
+            providerStatusSyncedAt: cancelledAt,
+            providerUsed: isProviderUsedOrder(order),
+            refundedAt: walletRefundAmount > 0 ? cancelledAt : null,
+            securityEventType: walletRefundAmount > 0 ? 'cancel_refund_completed' : 'cancel_refund_blocked_provider_cost',
+            reason: walletRefundAmount > 0
+                ? 'user_cancelled'
+                : (!cancelResult.success
+                    ? 'provider_cancel_verification_failed'
+                    : 'provider_balance_cost_remaining'),
+            recordRiskEvent: walletRefundAmount <= 0,
+            syncNumberHistory: true,
+            syncUserRisk: walletRefundAmount <= 0,
+            eventAt: cancelledAt,
             finalizedAt: cancelledAt
+        }, {
+            client
         });
+        if (providerBalanceAfterCancel.success) {
+            await insertProviderBalanceSnapshot({
+                orderId: updatedOrder?.id || order.id,
+                userId: user.id,
+                activationId: order.activation_id,
+                reason: walletRefundAmount > 0 ? 'order_cancel_after' : 'order_cancel_after_blocked',
+                providerBalance: providerBalanceAfterCancel.balance,
+                previousBalance: providerBalanceBaselineForCancel.success
+                    ? providerBalanceBaselineForCancel.balance
+                    : (order.provider_balance_after == null ? null : Number(order.provider_balance_after)),
+                expectedSpendPkr: remainingProviderCostPkr,
+                note: cancelResult.raw || (walletRefundAmount > 0 ? 'order_cancel' : 'cancel_refund_blocked')
+            }, {
+                client
+            });
+        }
         await client.query('COMMIT');
-        logOrderHotfixEvent('cancel_refund_completed', updatedOrder, {
+        logOrderHotfixEvent(walletRefundAmount > 0 ? 'cancel_refund_completed' : 'cancel_refund_blocked_provider_cost', updatedOrder, {
             cancelTime: cancelledAt,
-            refundTime: cancelledAt,
-            reason: 'user_cancelled'
+            refundTime: walletRefundAmount > 0 ? cancelledAt : null,
+            providerStatus: cancelResult.raw || null,
+            reason: walletRefundAmount > 0
+                ? 'user_cancelled'
+                : (!cancelResult.success ? 'provider_cancel_verification_failed' : 'provider_balance_cost_remaining')
         });
-        res.send('OK');
+        res.status(walletRefundAmount > 0 ? 200 : 409).send(walletRefundAmount > 0
+            ? 'Order cancelled & refunded'
+            : (!cancelResult.success
+                ? 'Order cancelled, but refund was blocked because provider cancellation could not be verified.'
+                : 'Order cancelled, but refund was blocked because provider cost is still charged.'));
     } catch (err) {
         await client.query('ROLLBACK');
         res.status(500).send(formatSafeError(err, 'Cancel failed'));
@@ -8692,21 +10004,42 @@ app.get('/api/orders/:orderId/otp', ensureAuth, async (req, res) => {
         if (order.user_id !== user.id && !isAdminUser(user)) {
             return res.status(403).send('Unauthorized');
         }
+        const shouldTrackClosedAccess = !isAdminUser(user) && order.user_id === user.id;
         if (normalizeOrderStatus(order) === 'expired') {
+            if (shouldTrackClosedAccess) {
+                await registerClosedOrderAccess(order, {
+                    eventType: 'post_close_otp_poll',
+                    reason: 'expired_order_access'
+                });
+            }
             return res.json({
                 received: false,
                 expired: true,
-                refunded: true,
+                refunded: getWebsiteRefundAmount(order) > 0,
                 inactive: true,
-                message: EXPIRED_REFUND_MESSAGE,
+                message: getWebsiteRefundAmount(order) > 0
+                    ? EXPIRED_REFUND_MESSAGE
+                    : 'Order expired, but refund is blocked until provider cost is cleared.',
                 status: order.status || order.order_status
             });
         }
         if (isFinalOrderState(order)) {
+            if (shouldTrackClosedAccess) {
+                await registerClosedOrderAccess(order, {
+                    eventType: 'post_close_otp_poll',
+                    reason: 'final_order_access'
+                });
+            }
             return res.json({ received: false, inactive: true, status: order.status || order.order_status });
         }
         if (hasStoredOtp(order)) {
             if (normalizeOrderStatus(order) !== 'active') {
+                if (shouldTrackClosedAccess) {
+                    await registerClosedOrderAccess(order, {
+                        eventType: 'post_close_otp_poll',
+                        reason: 'otp_present_on_closed_order_access'
+                    });
+                }
                 logOrderHotfixEvent('otp_ignored_non_active_order', order, {
                     otpArrivalTime: new Date().toISOString(),
                     providerStatus: order.provider_last_status,
@@ -8756,6 +10089,15 @@ app.get('/api/orders/:orderId/otp', ensureAuth, async (req, res) => {
                 return res.status(404).send('Order not found');
             }
             if (isFinalOrderState(lockedOrder)) {
+                if (shouldTrackClosedAccess) {
+                    await registerClosedOrderAccess(lockedOrder, {
+                        eventType: 'post_close_otp_poll',
+                        reason: 'final_order_access_locked',
+                        eventAt: new Date().toISOString()
+                    }, {
+                        client
+                    });
+                }
                 await client.query('COMMIT');
                 logOrderHotfixEvent('otp_ignored_after_final_state', lockedOrder, {
                     otpArrivalTime: new Date().toISOString(),
@@ -8767,6 +10109,15 @@ app.get('/api/orders/:orderId/otp', ensureAuth, async (req, res) => {
             if (hasStoredOtp(lockedOrder)) {
                 await client.query('COMMIT');
                 if (normalizeOrderStatus(lockedOrder) !== 'active') {
+                    if (shouldTrackClosedAccess) {
+                        await registerClosedOrderAccess(lockedOrder, {
+                            eventType: 'post_close_otp_poll',
+                            reason: 'otp_present_on_closed_order_locked_access',
+                            eventAt: new Date().toISOString()
+                        }, {
+                            client
+                        });
+                    }
                     logOrderHotfixEvent('otp_ignored_after_state_change', lockedOrder, {
                         otpArrivalTime: new Date().toISOString(),
                         providerStatus: providerSignal.rawStatus || null,
@@ -9091,6 +10442,7 @@ function startServer() {
 initDB()
     .then(() => {
         startServer();
+        startProviderReconciliationLoop();
     })
     .catch((err) => {
         console.error('Database initialization failed:', err);
