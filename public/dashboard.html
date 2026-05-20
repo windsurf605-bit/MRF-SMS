@@ -997,10 +997,59 @@ Spam activity = Ban risk</div>
                         </div>
                     </div>
                 </div>
+                <div class="admin-section-group admin-accordion-item" data-admin-accordion-item data-admin-accordion-id="provider">
+                    <button type="button" class="admin-accordion-trigger" data-action="toggle-admin-accordion" data-admin-accordion-id="provider" aria-expanded="false" aria-controls="admin-accordion-panel-provider">
+                        <span class="admin-accordion-copy">
+                            <span class="admin-section-kicker">2. Provider Intelligence</span>
+                            <span class="admin-section-title">Provider Intelligence</span>
+                            <span class="admin-section-copy">Track provider balance, real provider cost, risk events, and backend reconciliation without changing the rest of the dashboard.</span>
+                        </span>
+                        <span class="admin-accordion-indicator" aria-hidden="true"><i class="fa-solid fa-chevron-down"></i></span>
+                    </button>
+                    <div id="admin-accordion-panel-provider" class="admin-accordion-panel" data-admin-accordion-panel>
+                        <div class="admin-accordion-panel-inner">
+                            <div class="admin-data-card">
+                                <div class="mb-4">
+                                    <h4 class="text-lg font-semibold text-slate-900">Provider Summary</h4>
+                                    <p class="mt-1 text-sm text-slate-500">Latest provider balance, real provider spend, real profit/loss, and reconciliation mismatch status.</p>
+                                </div>
+                                <div id="admin-provider-summary" class="scroll-area overflow-x-auto"></div>
+                            </div>
+                            <div class="admin-data-card">
+                                <div class="mb-4">
+                                    <h4 class="text-lg font-semibold text-slate-900">Provider Service Breakdown</h4>
+                                    <p class="mt-1 text-sm text-slate-500">Service-wise real provider cost, profit/loss, and risk counts based on backend provider-truth fields.</p>
+                                </div>
+                                <div id="admin-provider-service-breakdown" class="scroll-area overflow-x-auto"></div>
+                            </div>
+                            <div class="admin-data-card">
+                                <div class="mb-4">
+                                    <h4 class="text-lg font-semibold text-slate-900">Provider Balance Snapshots</h4>
+                                    <p class="mt-1 text-sm text-slate-500">Scheduled reconciliation and order action balance snapshots with unmatched delta tracking.</p>
+                                </div>
+                                <div id="admin-provider-balance-list" class="scroll-area overflow-x-auto"></div>
+                            </div>
+                            <div class="admin-data-card">
+                                <div class="mb-4">
+                                    <h4 class="text-lg font-semibold text-slate-900">Security Events &amp; Risk Users</h4>
+                                    <p class="mt-1 text-sm text-slate-500">Backend-detected provider anomalies, exploit signals, and the users currently carrying risk.</p>
+                                </div>
+                                <div id="admin-provider-security-list" class="scroll-area overflow-x-auto"></div>
+                                <div class="mt-6 border-t border-slate-200 pt-6">
+                                    <div class="mb-4">
+                                        <h5 class="text-base font-semibold text-slate-900">Top Risk Users</h5>
+                                        <p class="mt-1 text-sm text-slate-500">Users with elevated backend risk score or an active security block.</p>
+                                    </div>
+                                    <div id="admin-provider-risk-users" class="scroll-area overflow-x-auto"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
                 <div class="admin-section-group admin-accordion-item" data-admin-accordion-item data-admin-accordion-id="finance">
                     <button type="button" class="admin-accordion-trigger" data-action="toggle-admin-accordion" data-admin-accordion-id="finance" aria-expanded="false" aria-controls="admin-accordion-panel-finance">
                         <span class="admin-accordion-copy">
-                            <span class="admin-section-kicker">2. Payment Management</span>
+                            <span class="admin-section-kicker">3. Payment Management</span>
                             <span class="admin-section-title">Payment Management</span>
                             <span class="admin-section-copy">Handle pending proofs, processed payment requests, and the finance ledger in one light section.</span>
                         </span>
@@ -1035,7 +1084,7 @@ Spam activity = Ban risk</div>
                 <div class="admin-section-group admin-accordion-item" data-admin-accordion-item data-admin-accordion-id="users">
                     <button type="button" class="admin-accordion-trigger" data-action="toggle-admin-accordion" data-admin-accordion-id="users" aria-expanded="false" aria-controls="admin-accordion-panel-users">
                         <span class="admin-accordion-copy">
-                            <span class="admin-section-kicker">3. User Management</span>
+                            <span class="admin-section-kicker">4. User Management</span>
                             <span class="admin-section-title">User Management</span>
                             <span class="admin-section-copy">Check totals, user spending, balances, and selected-user history in a simple layout.</span>
                         </span>
@@ -1084,7 +1133,7 @@ Spam activity = Ban risk</div>
                 <div class="admin-section-group admin-accordion-item" data-admin-accordion-item data-admin-accordion-id="system">
                     <button type="button" class="admin-accordion-trigger" data-action="toggle-admin-accordion" data-admin-accordion-id="system" aria-expanded="false" aria-controls="admin-accordion-panel-system">
                         <span class="admin-accordion-copy">
-                            <span class="admin-section-kicker">4. System Management</span>
+                            <span class="admin-section-kicker">5. System Management</span>
                             <span class="admin-section-title">System Management</span>
                             <span class="admin-section-copy">Review manual balance changes and referral activity without mixing them into finance or user tables.</span>
                         </span>
@@ -1112,7 +1161,7 @@ Spam activity = Ban risk</div>
                 <div class="admin-section-group admin-accordion-item" data-admin-accordion-item data-admin-accordion-id="orders">
                     <button type="button" class="admin-accordion-trigger" data-action="toggle-admin-accordion" data-admin-accordion-id="orders" aria-expanded="false" aria-controls="admin-accordion-panel-orders">
                         <span class="admin-accordion-copy">
-                            <span class="admin-section-kicker">5. Orders Breakdown</span>
+                            <span class="admin-section-kicker">6. Orders Breakdown</span>
                             <span class="admin-section-title">Orders Breakdown</span>
                             <span class="admin-section-copy">Scan order price, API cost, profit, and status in a single lightweight table.</span>
                         </span>
