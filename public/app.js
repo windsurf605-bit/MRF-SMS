@@ -3020,16 +3020,37 @@ function renderActiveOrders(orders) {
     syncWaitingOrdersVisibility();
 }
 
+function getOrderApiCost(order) {
+    if (order?.real_provider_cost != null && Number.isFinite(Number(order.real_provider_cost))) {
+        return Number(order.real_provider_cost || 0);
+    }
+    if (order?.provider_cost_pkr != null && Number.isFinite(Number(order.provider_cost_pkr))) {
+        return Number(order.provider_cost_pkr || 0);
+    }
+    return 0;
+}
+
 function getOrderProfit(order) {
-    const providerCost = Number(order?.provider_cost_pkr || 0);
+    const websiteCharge = Number(order?.website_charge ?? order?.price ?? 0);
+    const websiteRefund = Number(order?.website_refund ?? 0);
+    const providerCost = getOrderApiCost(order);
+    if (order?.real_profit_loss != null && Number.isFinite(Number(order.real_profit_loss))) {
+        return Number(order.real_profit_loss || 0);
+    }
     if (order?.profit_pkr != null && Number.isFinite(Number(order.profit_pkr))) {
         return Number(order.profit_pkr || 0);
     }
-    return Number(order?.price || 0) - providerCost;
+    return websiteCharge - websiteRefund - providerCost;
 }
 
 function getOrderFinancialTimestamp(order) {
     return order?.completed_at || order?.last_purchase_at || order?.created_at || null;
+}
+
+function formatProviderBalanceValue(value, currency = 'USD') {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return `— ${currency}`;
+    return `${amount.toFixed(3)} ${currency || 'USD'}`;
 }
 
 function isTodayDate(value) {
@@ -3182,6 +3203,169 @@ function renderAdminUserSpending(spending, users) {
     container.innerHTML = `${summaryMarkup}<div class="mt-4">${renderAdminTable(['User ID', 'User', 'Email', 'Amount Spent'], rows, 'min-w-[860px]')}</div>`;
 }
 
+function renderAdminProviderSummary(summary) {
+    const container = qs('admin-provider-summary');
+    if (!container) return;
+    const cards = [
+        {
+            title: 'Provider Balance',
+            value: formatProviderBalanceValue(summary?.latestProviderBalance, summary?.latestProviderBalanceCurrency || 'USD'),
+            detail: summary?.latestReconciliationAt
+                ? `Last sync ${formatRelativeTime(summary.latestReconciliationAt)}`
+                : 'Waiting for first reconciliation',
+            tone: 'border-cyan-200 bg-cyan-50 text-cyan-700'
+        },
+        {
+            title: 'Real Provider Cost',
+            value: formatMoneyPrecise(summary?.totalRealProviderCost || 0),
+            detail: `${Number(summary?.providerUsedOrders || 0)} provider-used orders`,
+            tone: 'border-amber-200 bg-amber-50 text-amber-700'
+        },
+        {
+            title: 'Real Profit / Loss',
+            value: formatMoneyPrecise(summary?.totalRealProfitLoss || 0),
+            detail: `${Number(summary?.refundedOrders || 0)} refunded orders`,
+            tone: Number(summary?.totalRealProfitLoss || 0) >= 0
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                : 'border-rose-200 bg-rose-50 text-rose-700'
+        },
+        {
+            title: 'Risk Overview',
+            value: `${Number(summary?.riskOrders || 0)} / ${Number(summary?.criticalOrders || 0)}`,
+            detail: `${Number(summary?.riskyUsers || 0)} risky users • ${Number(summary?.blockedUsers || 0)} blocked`,
+            tone: summary?.latestAnomalyFlag
+                ? 'border-rose-200 bg-rose-50 text-rose-700'
+                : 'border-slate-200 bg-slate-50 text-slate-700'
+        }
+    ];
+    const headerMarkup = `
+        <div class="grid gap-3 xl:grid-cols-4">
+            ${cards.map((card) => `
+                <div class="rounded-2xl border p-4 ${card.tone}">
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.18em]">${escapeHtml(card.title)}</div>
+                    <div class="mt-2 text-2xl font-extrabold tracking-tight">${escapeHtml(card.value)}</div>
+                    <div class="mt-2 text-sm text-slate-500">${escapeHtml(card.detail)}</div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+    const reconciliationNote = `
+        <div class="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+            <div class="font-semibold text-slate-900">Latest reconciliation</div>
+            <div class="mt-1">Reason: ${escapeHtml(summary?.latestReconciliationReason || '—')}</div>
+            <div class="mt-1">Unmatched delta: <strong>${escapeHtml(formatMoneyPrecise(summary?.latestUnmatchedDeltaPkr || 0))}</strong></div>
+            <div class="mt-1">Website charge / refund: ${escapeHtml(formatMoneyPrecise(summary?.totalWebsiteCharge || 0))} / ${escapeHtml(formatMoneyPrecise(summary?.totalWebsiteRefund || 0))}</div>
+        </div>
+    `;
+    container.innerHTML = `${headerMarkup}${reconciliationNote}`;
+}
+
+function renderAdminProviderServiceBreakdown(entries) {
+    const container = qs('admin-provider-service-breakdown');
+    if (!container) return;
+    if (!entries.length) {
+        container.innerHTML = renderEmptyState('No provider service data yet', 'Service-wise provider cost and risk data will appear automatically after order activity.');
+        return;
+    }
+    const rows = entries.map((entry) => `
+        <tr class="border-b border-slate-200 align-top last:border-b-0">
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatStatus(entry.provider_service || 'unknown'))}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(String(entry.total_orders || 0))}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(String(entry.risk_orders || 0))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(entry.total_real_provider_cost || 0))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold ${(Number(entry.total_real_profit_loss || 0) >= 0) ? 'text-emerald-700' : 'text-rose-700'}">${escapeHtml(formatMoneyPrecise(entry.total_real_profit_loss || 0))}</td>
+        </tr>
+    `).join('');
+    container.innerHTML = renderAdminTable(
+        ['Service', 'Orders', 'Risk Orders', 'Real Provider Cost', 'Real Profit / Loss'],
+        rows,
+        'min-w-[860px]'
+    );
+}
+
+function renderAdminProviderBalanceSnapshots(entries) {
+    const container = qs('admin-provider-balance-list');
+    if (!container) return;
+    if (!entries.length) {
+        container.innerHTML = renderEmptyState('No provider balance snapshots yet', 'Scheduled reconciliation and order actions will populate balance snapshots here.');
+        return;
+    }
+    const rows = entries.map((entry) => `
+        <tr class="border-b border-slate-200 align-top last:border-b-0 ${entry.anomaly_flag ? 'bg-rose-50/60' : ''}">
+            <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(formatRelativeTime(entry.created_at))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-medium text-slate-900">${escapeHtml(formatStatus(entry.reason || 'snapshot'))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatProviderBalanceValue(entry.provider_balance, entry.provider_balance_currency || 'USD'))}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(entry.delta_pkr || 0))}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(entry.expected_spend_pkr || 0))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold ${(Number(entry.unmatched_delta_pkr || 0) === 0) ? 'text-slate-700' : 'text-rose-700'}">${escapeHtml(formatMoneyPrecise(entry.unmatched_delta_pkr || 0))}</td>
+            <td class="px-4 py-3">${entry.anomaly_flag
+                ? '<span class="inline-flex items-center rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700 ring-1 ring-rose-200">Flagged</span>'
+                : '<span class="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 ring-1 ring-emerald-200">OK</span>'}</td>
+        </tr>
+    `).join('');
+    container.innerHTML = renderAdminTable(
+        ['Time', 'Reason', 'Balance', 'Delta', 'Expected', 'Unmatched', 'Status'],
+        rows,
+        'min-w-[1020px]'
+    );
+}
+
+function renderAdminProviderSecurityEvents(events) {
+    const container = qs('admin-provider-security-list');
+    if (!container) return;
+    if (!events.length) {
+        container.innerHTML = renderEmptyState('No provider security events yet', 'Risk, exploit, and reconciliation events will appear here when the backend flags them.');
+        return;
+    }
+    const rows = events.map((event) => {
+        const flags = [
+            event.critical_exploit ? 'Critical' : '',
+            event.loss_detected ? 'Loss' : '',
+            event.risk_flag ? 'Risk' : ''
+        ].filter(Boolean).join(' • ') || 'Tracked';
+        return `
+            <tr class="border-b border-slate-200 align-top last:border-b-0 ${(event.critical_exploit || event.loss_detected) ? 'bg-rose-50/60' : ''}">
+                <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(formatRelativeTime(event.created_at))}</td>
+                <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(formatStatus(event.event_type || 'event'))}</td>
+                <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(event.username || event.phone_number || 'System')}</td>
+                <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(event.reason || '—')}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(event.provider_final_status || event.provider_status || '—')}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(event.real_provider_cost || 0))} / ${escapeHtml(formatMoneyPrecise(event.website_refund || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold ${(event.critical_exploit || event.loss_detected) ? 'text-rose-700' : 'text-slate-700'}">${escapeHtml(flags)}</td>
+            </tr>
+        `;
+    }).join('');
+    container.innerHTML = renderAdminTable(
+        ['Time', 'Event', 'User / Phone', 'Reason', 'Provider Status', 'Cost / Refund', 'Flags'],
+        rows,
+        'min-w-[1180px]'
+    );
+}
+
+function renderAdminProviderRiskUsers(users) {
+    const container = qs('admin-provider-risk-users');
+    if (!container) return;
+    if (!users.length) {
+        container.innerHTML = renderEmptyState('No risky users flagged', 'Suspicious and blocked users will appear here once backend scoring detects abuse patterns.');
+        return;
+    }
+    const rows = users.map((user) => `
+        <tr class="border-b border-slate-200 align-top last:border-b-0 ${String(user.security_risk_status || '').toLowerCase() === 'dangerous' ? 'bg-rose-50/60' : ''}">
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(String(user.id || '—'))}</td>
+            <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(user.name || 'Unknown user')}</td>
+            <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(user.email || '—')}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(String(Number(user.security_risk_score || 0)))}</td>
+            <td class="px-4 py-3">${renderStatusBadge(user.security_risk_status || 'safe')}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(user.security_blocked_until ? formatRelativeTime(user.security_blocked_until) : '—')}</td>
+        </tr>
+    `).join('');
+    container.innerHTML = renderAdminTable(
+        ['User ID', 'Name', 'Email', 'Risk Score', 'Risk Status', 'Blocked Until'],
+        rows,
+        'min-w-[980px]'
+    );
+}
+
 function renderAdminStats(stats) {
     const container = qs('admin-stats-list');
     if (!container) return;
@@ -3218,10 +3402,8 @@ function renderAdminOrders(orders) {
     const rows = orders.map((order) => {
         const service = getServiceMeta(order.service_type);
         const lifecycleStatus = getOrderLifecycleStatus(order);
-        const providerCost = Number(order.provider_cost_pkr || 0);
-        const profit = order.profit_pkr != null
-            ? Number(order.profit_pkr || 0)
-            : Number(order.price || 0) - providerCost;
+        const providerCost = getOrderApiCost(order);
+        const profit = getOrderProfit(order);
         return `
             <tr class="border-b border-slate-200 align-top last:border-b-0">
                 <td class="px-4 py-3 break-all text-slate-700">${escapeHtml(order.user_email || 'Unknown email')}</td>
@@ -3701,14 +3883,15 @@ async function loadAdminData() {
     if (!state.currentUser || !state.currentUser.isAdmin) return;
     try {
         const adminScrollPositions = captureAdminScrollPositions();
-        const [orders, paymentRequests, ledgerTransactions, pendingTransactions, users, balanceAdjustments, referrals] = await Promise.all([
+        const [orders, paymentRequests, ledgerTransactions, pendingTransactions, users, balanceAdjustments, referrals, providerAnalytics] = await Promise.all([
             fetchJSON('/api/admin/orders'),
             fetchJSON('/api/admin/payment-requests'),
             fetchJSON('/api/admin/transactions/history'),
             fetchJSON('/api/admin/transactions'),
             fetchJSON('/api/admin/users'),
             fetchJSON('/api/admin/balance-adjustments'),
-            fetchJSON('/api/admin/referrals')
+            fetchJSON('/api/admin/referrals'),
+            fetchJSON('/api/admin/provider-analytics')
         ]);
         state.adminUsers = users;
         state.adminBalanceAdjustments = balanceAdjustments;
@@ -3732,14 +3915,19 @@ async function loadAdminData() {
         const todaySuccessfulOrders = successfulOrders.filter((order) => isTodayDate(getOrderFinancialTimestamp(order)));
         const totalIncome = successfulOrders.reduce((sum, order) => sum + Number(order.price || 0), 0);
         const todayIncome = todaySuccessfulOrders.reduce((sum, order) => sum + Number(order.price || 0), 0);
-        const totalApiCost = successfulOrders.reduce((sum, order) => sum + Number(order.provider_cost_pkr || 0), 0);
-        const todayApiCost = todaySuccessfulOrders.reduce((sum, order) => sum + Number(order.provider_cost_pkr || 0), 0);
+        const totalApiCost = successfulOrders.reduce((sum, order) => sum + getOrderApiCost(order), 0);
+        const todayApiCost = todaySuccessfulOrders.reduce((sum, order) => sum + getOrderApiCost(order), 0);
         const totalProfit = successfulOrders.reduce((sum, order) => sum + getOrderProfit(order), 0);
         const todayProfit = todaySuccessfulOrders.reduce((sum, order) => sum + getOrderProfit(order), 0);
         renderAdminStats({ totalDeposits, todayDeposits, totalIncome, todayIncome, totalApiCost, todayApiCost, totalProfit, todayProfit });
         renderAdminTotalUsersSummary(users);
         renderAdminDailyProfitDetails(calculateDailyProfitDetails(orders), { todayProfit, totalProfit });
         renderAdminUserSpending(calculateUserSpending(orders), users);
+        renderAdminProviderSummary(providerAnalytics?.summary || {});
+        renderAdminProviderServiceBreakdown(providerAnalytics?.serviceBreakdown || []);
+        renderAdminProviderBalanceSnapshots(providerAnalytics?.recentBalanceSnapshots || []);
+        renderAdminProviderSecurityEvents(providerAnalytics?.recentSecurityEvents || []);
+        renderAdminProviderRiskUsers(providerAnalytics?.topRiskUsers || []);
         qs('admin-payment-requests-list').innerHTML = renderAdminPaymentRequests(pendingPaymentRequests, pendingTransactions);
         renderAdminOrders(orders);
         qs('admin-payment-history-list').innerHTML = renderAdminPaymentHistory(processedPaymentRequests);
