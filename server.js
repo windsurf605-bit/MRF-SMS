@@ -3218,6 +3218,7 @@ const whatsappCountries = [
     { name: 'USA', code: '+1', price: 470, countryId: 187, flag: '🇺🇸' },
     { name: 'United Kingdom', code: '+44', price: 300, countryId: 16, flag: '🇬🇧' },
     { name: 'Chile', code: '+56', price: 68.07, countryId: 151, flag: '🇨🇱' },
+    { name: 'India', code: '+91', price: 390, countryId: 22, flag: '🇮🇳' },
     { name: 'Peru', code: '+51', price: 122.67, countryId: 65, flag: '🇵🇪' },
     { name: 'Hong Kong', code: '+852', price: 122.67, countryId: 14, flag: '🇭🇰' },
     { name: 'Argentina', code: '+54', price: 122.67, countryId: 39, flag: '🇦🇷' },
