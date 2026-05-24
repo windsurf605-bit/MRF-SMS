@@ -221,6 +221,10 @@
         .admin-panel .admin-accordion-panel-inner{padding:0 14px 14px}
         .admin-panel .admin-data-card{margin-top:12px;border-radius:16px;border:1px solid #e5e7eb!important;background:#ffffff!important;padding:14px;box-shadow:none!important}
         .admin-panel .admin-data-card:first-child{margin-top:0}
+        .admin-live-refresh-indicator{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;margin-left:8px;color:#94a3b8;vertical-align:middle}
+        .admin-live-refresh-indicator.is-refreshing{color:#16a34a}
+        .admin-live-refresh-indicator.is-refreshing i{animation:adminLiveRefreshSpin .8s linear infinite}
+        @keyframes adminLiveRefreshSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
         .admin-panel .admin-search-shell{border-color:#e5e7eb!important;background:#ffffff!important}
         .admin-panel .admin-search-input{color:#111827!important}
         .admin-panel .admin-search-input::placeholder{color:#94a3b8!important}
@@ -1010,7 +1014,7 @@ Spam activity = Ban risk</div>
                         <div class="admin-accordion-panel-inner">
                             <div class="admin-data-card">
                                 <div class="mb-4">
-                                    <h4 class="text-lg font-semibold text-slate-900">Provider Summary</h4>
+                                    <h4 class="text-lg font-semibold text-slate-900">Provider Summary<span id="admin-provider-summary-refresh-icon" class="admin-live-refresh-indicator" aria-label="Live refresh" aria-busy="false"><i class="fa-solid fa-rotate"></i></span></h4>
                                     <p class="mt-1 text-sm text-slate-500">Latest provider balance, real provider spend, real profit/loss, and reconciliation mismatch status.</p>
                                 </div>
                                 <div id="admin-provider-summary" class="scroll-area overflow-x-auto"></div>
@@ -1059,7 +1063,7 @@ Spam activity = Ban risk</div>
                         <div class="admin-accordion-panel-inner">
                             <div class="admin-data-card">
                                 <div class="mb-4">
-                                    <h4 class="text-lg font-semibold text-slate-900">Pending Payment Requests</h4>
+                                    <h4 class="text-lg font-semibold text-slate-900">Pending Payment Requests<span id="admin-payment-requests-refresh-icon" class="admin-live-refresh-indicator" aria-label="Live refresh" aria-busy="false"><i class="fa-solid fa-rotate"></i></span></h4>
                                     <p class="mt-1 text-sm text-slate-500">Review screenshot proofs and approve or cancel pending add-money requests.</p>
                                 </div>
                                 <div id="admin-payment-requests-list" class="scroll-area overflow-x-auto"></div>
