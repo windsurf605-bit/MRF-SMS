@@ -16,6 +16,8 @@ const state = {
     otpInterval: null,
     timerInterval: null,
     adminRefreshInterval: null,
+    adminProviderSummaryRefreshInFlight: false,
+    adminPendingPaymentsRefreshInFlight: false,
     adminAlertInterval: null,
     adminAlertTimeout: null,
     lastPendingCount: 0,
@@ -25,6 +27,8 @@ const state = {
     hiddenCancelledOrderIds: new Set(),
     otpBlockedOrderIds: new Set(),
     cancelPendingOrderIds: new Set(),
+    expiringOrderIds: new Set(),
+    expiredOrderRetryAt: new Map(),
     expireRequestInFlight: false,
     historyView: 'activations',
     numberHistorySearch: '',
@@ -51,6 +55,7 @@ const state = {
 };
 
 const ORDER_PROVIDER_WAITING_STATUS = 'STATUS_WAIT_CODE';
+const ADMIN_LIVE_REFRESH_INTERVAL_MS = 9000;
 
 const adminAccordion = {
     panel: null,
@@ -1993,6 +1998,145 @@ function suppressCancelledOrderInDashboard(orderId) {
     state.completedOrders = filterHiddenCancelledOrders(state.completedOrders);
 }
 
+function setElementHtmlIfChanged(target, markup) {
+    const element = typeof target === 'string' ? qs(target) : target;
+    if (!element) return false;
+    if (element.innerHTML === markup) return false;
+    element.innerHTML = markup;
+    return true;
+}
+
+function setAdminSectionRefreshing(indicatorId, refreshing) {
+    const indicator = qs(indicatorId);
+    if (!indicator) return;
+    indicator.classList.toggle('is-refreshing', Boolean(refreshing));
+    indicator.setAttribute('aria-busy', refreshing ? 'true' : 'false');
+}
+
+function isAutoExpirableDashboardOrder(order) {
+    const expiry = order?.expires_at ? new Date(order.expires_at) : null;
+    return Boolean(order)
+        && getOrderLifecycleStatus(order) === 'pending'
+        && !hasOrderOtp(order)
+        && !order?.sms_received
+        && expiry instanceof Date
+        && !Number.isNaN(expiry.getTime())
+        && new Date() >= expiry;
+}
+
+async function finalizeExpiredOrderDashboardState(orderId, message, options = {}) {
+    const shouldUpdateModal = options.updateModal ?? Boolean(state.activeOrder && String(state.activeOrder.id) === String(orderId));
+    const refunded = options.refunded !== false;
+    suppressCancelledOrderInDashboard(orderId);
+    state.expiredOrderRetryAt.delete(normalizeDashboardOrderId(orderId));
+    if (shouldUpdateModal && state.activeOrder && String(state.activeOrder.id) === String(orderId)) {
+        closeOrderModal();
+    } else {
+        renderActiveOrders(state.orders);
+    }
+    await loadNumberHistory();
+    setHistoryView(state.historyView);
+    if (refunded) {
+        await refreshWalletBalanceSilently({ showIncreaseToast: false });
+    }
+    showToast(message, refunded ? 'success' : 'info', 6000);
+}
+
+async function queueDashboardOrderExpiry(order) {
+    const normalizedOrderId = normalizeDashboardOrderId(order);
+    if (!normalizedOrderId || !isAutoExpirableDashboardOrder(order)) return false;
+    if (state.expiringOrderIds.has(normalizedOrderId)) return false;
+    const nextRetryAt = Number(state.expiredOrderRetryAt.get(normalizedOrderId) || 0);
+    if (nextRetryAt > Date.now()) return false;
+    state.expiringOrderIds.add(normalizedOrderId);
+    try {
+        const expired = await requestOrderExpiry(order.id, {
+            updateModal: Boolean(state.activeOrder && String(state.activeOrder.id) === String(order.id))
+        });
+        if (!expired) {
+            state.expiredOrderRetryAt.set(normalizedOrderId, Date.now() + 8000);
+        }
+        return expired;
+    } finally {
+        state.expiringOrderIds.delete(normalizedOrderId);
+    }
+}
+
+async function processExpiredDashboardOrders() {
+    if (!state.currentUser || state.expireRequestInFlight) return;
+    const expiredOrders = (state.orders || []).filter((order) => isAutoExpirableDashboardOrder(order) && !isOrderOtpFlowBlocked(order));
+    for (const order of expiredOrders) {
+        await queueDashboardOrderExpiry(order);
+    }
+}
+
+function syncAdminPendingPaymentAlerts(totalPendingCount) {
+    if (totalPendingCount > 0) {
+        if (totalPendingCount > state.lastPendingCount) {
+            startAdminAlertLoop();
+            showToast(`New payment request received. Pending approvals: ${totalPendingCount}`, 'success', 30000, {
+                dismissLabel: 'Mute',
+                onDismiss: stopAdminAlertLoop
+            });
+            browserNotify('MRF SMS Admin Alert', `New payment request received. Pending approvals: ${totalPendingCount}`);
+        }
+    }
+    if (totalPendingCount === 0 || totalPendingCount < state.lastPendingCount) {
+        stopAdminAlertLoop();
+    }
+    state.lastPendingCount = totalPendingCount;
+}
+
+async function refreshAdminProviderSummarySection(options = {}) {
+    if (!state.currentUser?.isAdmin || state.adminProviderSummaryRefreshInFlight) return;
+    if (!qs('admin-provider-summary')) return;
+    state.adminProviderSummaryRefreshInFlight = true;
+    setAdminSectionRefreshing('admin-provider-summary-refresh-icon', true);
+    try {
+        const providerAnalytics = await fetchJSON('/api/admin/provider-analytics');
+        renderAdminProviderSummary(providerAnalytics?.summary || {});
+    } catch (err) {
+        if (!options.silent) {
+            showToast(err.message || 'Failed to refresh provider summary', 'error');
+        }
+    } finally {
+        state.adminProviderSummaryRefreshInFlight = false;
+        setAdminSectionRefreshing('admin-provider-summary-refresh-icon', false);
+    }
+}
+
+async function refreshAdminPendingPaymentsSection(options = {}) {
+    if (!state.currentUser?.isAdmin || state.adminPendingPaymentsRefreshInFlight) return;
+    if (!qs('admin-payment-requests-list')) return;
+    state.adminPendingPaymentsRefreshInFlight = true;
+    setAdminSectionRefreshing('admin-payment-requests-refresh-icon', true);
+    try {
+        const [paymentRequests, pendingTransactions] = await Promise.all([
+            fetchJSON('/api/admin/payment-requests'),
+            fetchJSON('/api/admin/transactions')
+        ]);
+        const pendingPaymentRequests = paymentRequests.filter((request) => String(request.status || '').toLowerCase() === 'pending');
+        setElementHtmlIfChanged('admin-payment-requests-list', renderAdminPaymentRequests(pendingPaymentRequests, pendingTransactions));
+        syncAdminPendingPaymentAlerts(pendingPaymentRequests.length + pendingTransactions.length);
+    } catch (err) {
+        if (!options.silent) {
+            showToast(err.message || 'Failed to refresh pending payments', 'error');
+        }
+    } finally {
+        state.adminPendingPaymentsRefreshInFlight = false;
+        setAdminSectionRefreshing('admin-payment-requests-refresh-icon', false);
+    }
+}
+
+function ensureLightAdminAutoRefresh() {
+    if (!state.currentUser?.isAdmin || state.adminRefreshInterval) return;
+    state.adminRefreshInterval = window.setInterval(() => {
+        if (!state.currentUser?.isAdmin || document.hidden) return;
+        void refreshAdminProviderSummarySection({ silent: true });
+        void refreshAdminPendingPaymentsSection({ silent: true });
+    }, ADMIN_LIVE_REFRESH_INTERVAL_MS);
+}
+
 function formatCountdown(targetValue, expiredLabel = 'Expired') {
     const target = targetValue ? new Date(targetValue) : null;
     if (!target || Number.isNaN(target.getTime())) return expiredLabel;
@@ -2592,6 +2736,7 @@ function refreshInlineOrderCountdowns() {
             ? 'Cancel and refund this order'
             : cancelLockMessage;
     });
+    void processExpiredDashboardOrders();
 }
 
 function syncInlineOrderTimers() {
@@ -2657,6 +2802,10 @@ function mergeOrdersWithLocalState(fetchedOrders) {
     const localPendingOrders = localOrders.filter((order) => {
         if (!order || order.id == null) return false;
         if (fetchedIds.has(String(order.id))) return false;
+        if (isAutoExpirableDashboardOrder(order)) {
+            void queueDashboardOrderExpiry(order);
+            return false;
+        }
         return ['pending', 'active'].includes(getOrderLifecycleStatus(order));
     });
     return sortOrdersByMostRecent([...localPendingOrders, ...normalizedFetchedOrders].filter((order) => ['pending', 'active'].includes(getOrderLifecycleStatus(order))));
@@ -2670,6 +2819,7 @@ function ensureOrderCardVisible(orderData) {
 }
 
 async function pollWaitingInlineOrders() {
+    await processExpiredDashboardOrders();
     const waitingOrders = state.orders.filter((order) => {
         const isWaiting = isWaitingOrder(order);
         const isTrackedByModal = state.activeOrder && String(state.activeOrder.id) === String(order.id);
@@ -2742,12 +2892,11 @@ async function handleExpiredOrder(orderId, message = 'Time expired. Your money h
     if (state.expireRequestInFlight) return true;
     state.expireRequestInFlight = true;
     try {
-        await refreshActiveOrderState(orderId, { updateModal: shouldUpdateModal });
-        if (shouldUpdateModal) {
-            stopOrderIntervals();
-        }
-        showToast(message, 'success', 6000);
-        await refreshUserInfo();
+        const refreshed = await refreshActiveOrderState(orderId, { updateModal: shouldUpdateModal });
+        await finalizeExpiredOrderDashboardState(orderId, message, {
+            updateModal: shouldUpdateModal,
+            refunded: options.refunded !== false && getOrderLifecycleStatus(refreshed) === 'expired'
+        });
         return true;
     } catch (err) {
         showToast(err.message || message, 'info', 6000);
@@ -2770,8 +2919,10 @@ async function requestOrderExpiry(orderId, options = {}) {
             stopOrderIntervals();
         }
         if (result.expired) {
-            showToast(result.message || 'Time expired. Your money has been returned to your wallet.', 'success', 6000);
-            await refreshUserInfo();
+            await finalizeExpiredOrderDashboardState(orderId, result.message || 'Time expired. Your money has been returned to your wallet.', {
+                updateModal: shouldUpdateModal,
+                refunded: result.refunded !== false
+            });
         }
         return Boolean(result.expired);
     } catch (err) {
@@ -2836,7 +2987,10 @@ async function pollOtp(orderId, silent = false, options = {}) {
             return true;
         }
         if (result.expired) {
-            await handleExpiredOrder(orderId, result.message || 'Time expired. Your money has been returned to your wallet.', { updateModal: shouldUpdateModal });
+            await handleExpiredOrder(orderId, result.message || 'Time expired. Your money has been returned to your wallet.', {
+                updateModal: shouldUpdateModal,
+                refunded: result.refunded !== false
+            });
             return true;
         }
         if (result.inactive) {
@@ -3333,7 +3487,7 @@ function renderAdminProviderSummary(summary) {
             <div class="mt-1 ${summary?.todayLossWarning ? 'font-semibold text-rose-700' : 'text-slate-600'}">${escapeHtml(summary?.todayLossWarning ? 'Warning: provider losses are higher than expected today.' : 'No excess provider-loss warning detected for today.')}</div>
         </div>
     `;
-    container.innerHTML = `${headerMarkup}${reconciliationNote}`;
+    setElementHtmlIfChanged(container, `${headerMarkup}${reconciliationNote}`);
 }
 
 function renderAdminProviderServiceBreakdown(entries) {
@@ -4042,7 +4196,7 @@ async function loadAdminData() {
             }
             state.lastAdminSecurityEventId = Math.max(state.lastAdminSecurityEventId || 0, latestSecurityEventId);
         }
-        qs('admin-payment-requests-list').innerHTML = renderAdminPaymentRequests(pendingPaymentRequests, pendingTransactions);
+        setElementHtmlIfChanged('admin-payment-requests-list', renderAdminPaymentRequests(pendingPaymentRequests, pendingTransactions));
         renderAdminOrders(orders);
         qs('admin-payment-history-list').innerHTML = renderAdminPaymentHistory(processedPaymentRequests);
         qs('admin-financial-ledger-list').innerHTML = renderFinancialLedger(ledgerTransactions);
@@ -4056,20 +4210,7 @@ async function loadAdminData() {
         }
         restoreAdminScrollPositions(adminScrollPositions);
         syncAdminAccordionLayout();
-        if (totalPendingCount > 0) {
-            if (totalPendingCount > state.lastPendingCount) {
-                startAdminAlertLoop();
-                showToast(`New payment request received. Pending approvals: ${totalPendingCount}`, 'success', 30000, {
-                    dismissLabel: 'Mute',
-                    onDismiss: stopAdminAlertLoop
-                });
-                browserNotify('MRF SMS Admin Alert', `New payment request received. Pending approvals: ${totalPendingCount}`);
-            }
-        }
-        if (totalPendingCount === 0 || totalPendingCount < state.lastPendingCount) {
-            stopAdminAlertLoop();
-        }
-        state.lastPendingCount = totalPendingCount;
+        syncAdminPendingPaymentAlerts(totalPendingCount);
     } catch (err) {
         showToast(err.message || 'Failed to load admin dashboard', 'error');
     }
@@ -4097,6 +4238,7 @@ async function refreshUserInfo() {
                 || state.activeOrder;
         }
         renderActiveOrders(orders);
+        void processExpiredDashboardOrders();
         syncInlineOrderPolling({ immediate: true });
         await loadPaymentHistory();
         await loadNumberHistory();
@@ -4120,6 +4262,7 @@ async function refreshUserInfo() {
             qs('admin-panel').classList.remove('hidden');
             initAdminAccordion();
             await loadAdminData();
+            ensureLightAdminAutoRefresh();
         } else {
             qs('admin-panel').classList.add('hidden');
             if (state.adminRefreshInterval) window.clearInterval(state.adminRefreshInterval);
