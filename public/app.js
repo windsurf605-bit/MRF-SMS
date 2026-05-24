@@ -46,7 +46,8 @@ const state = {
     referralProgram: null,
     adminReferrals: [],
     pendingReferralCode: '',
-    shouldOpenRegisterFromLanding: false
+    shouldOpenRegisterFromLanding: false,
+    lastAdminSecurityEventId: 0
 };
 
 const ORDER_PROVIDER_WAITING_STATUS = 'STATUS_WAIT_CODE';
@@ -485,6 +486,50 @@ function getServiceIconFileName(url) {
         return decodeURIComponent(rawFileName);
     } catch {
         return rawFileName;
+    }
+}
+
+async function promptAdminUserSecurityAction(userId, action, userLabel = '') {
+    const normalizedAction = String(action || '').trim().toLowerCase();
+    const safeUserLabel = userLabel || `User #${userId}`;
+    let hours = 24;
+    if (normalizedAction === 'block') {
+        const hoursInput = window.prompt(`Block ${safeUserLabel} for how many hours?`, '24');
+        if (hoursInput == null) return;
+        hours = Number(hoursInput);
+        if (!Number.isFinite(hours) || hours <= 0) {
+            showToast('Enter valid block hours', 'error');
+            return;
+        }
+    }
+    const defaultReason = normalizedAction === 'block'
+        ? 'Manual admin block pending provider-loss review'
+        : normalizedAction === 'unblock'
+            ? 'Manual admin unblock after review'
+            : 'Manual admin risk removal after review';
+    const reasonInput = window.prompt(`Enter reason for ${normalizedAction.replace(/-/g, ' ')} on ${safeUserLabel}`, defaultReason);
+    if (reasonInput == null) return;
+    const reason = String(reasonInput || '').trim();
+    if (!reason) {
+        showToast('Reason is required', 'error');
+        return;
+    }
+    try {
+        const response = await fetch(`/api/admin/users/${Number(userId)}/security-action`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ action: normalizedAction, reason, hours })
+        });
+        if (!response.ok) throw new Error(await response.text());
+        await response.json();
+        showToast(`User ${normalizedAction.replace(/-/g, ' ')} updated`, 'success');
+        await loadAdminData();
+        if (state.currentUser) {
+            await refreshUserInfo();
+        }
+    } catch (err) {
+        showToast(err.message || 'User security action failed', 'error');
     }
 }
 
@@ -1161,6 +1206,7 @@ function formatStatus(status) {
     const normalized = String(status || '')
         .replace(/[_-]+/g, ' ')
         .toLowerCase();
+    if (normalized === 'completed waiting user action') return 'OTP Ready';
     if (normalized === 'otp_received' || normalized === 'active') return 'OTP Ready';
     if (normalized === 'pending') return 'Waiting for OTP';
     if (normalized === 'manual_adjustment') return 'Manual Adjustment';
@@ -1885,6 +1931,7 @@ function getOrderLifecycleStatus(order) {
     const hasOtp = hasOrderOtp(order);
     if (rawStatus === 'expired_refunded' || rawStatus === 'refunded') return 'expired';
     if (['completed', 'expired', 'cancelled'].includes(rawStatus)) return rawStatus;
+    if (rawStatus === 'completed_waiting_user_action') return 'active';
     if (rawStatus === 'otp_received') return 'active';
     if (rawStatus === 'retry_requested') return hasOtp ? 'active' : 'pending';
     if (rawStatus === 'active' && !hasOtp) return 'pending';
@@ -2657,6 +2704,21 @@ function syncInlineOrderPolling(options = {}) {
     }
 }
 
+function refreshOrdersOnVisibilityRestore() {
+    if (!state.currentUser || document.hidden) return;
+    if (state.activeOrder && !canShowOrderOtp(state.activeOrder) && !isFinalOrderLifecycle(state.activeOrder) && !isOrderOtpFlowBlocked(state.activeOrder)) {
+        void refreshActiveOrderState(state.activeOrder.id, { updateModal: true })
+            .then((order) => {
+                if (order && !canShowOrderOtp(order) && isWaitingOrder(order)) {
+                    return pollOtp(order.id, true);
+                }
+                return false;
+            })
+            .catch(() => {});
+    }
+    syncInlineOrderPolling({ immediate: true });
+}
+
 async function refreshActiveOrderState(orderId, options = {}) {
     const refreshed = await fetchJSON(`/api/orders/${orderId}`);
     upsertOrderInState(refreshed);
@@ -3208,6 +3270,12 @@ function renderAdminProviderSummary(summary) {
     if (!container) return;
     const cards = [
         {
+            title: 'User Wallet Balances',
+            value: formatMoneyPrecise(summary?.totalUserBalances || 0),
+            detail: `${Number(summary?.riskyUsers || 0)} suspicious users ready for review`,
+            tone: 'border-slate-200 bg-slate-50 text-slate-700'
+        },
+        {
             title: 'Provider Balance',
             value: formatProviderBalanceValue(summary?.latestProviderBalance, summary?.latestProviderBalanceCurrency || 'USD'),
             detail: summary?.latestReconciliationAt
@@ -3222,9 +3290,15 @@ function renderAdminProviderSummary(summary) {
             tone: 'border-amber-200 bg-amber-50 text-amber-700'
         },
         {
+            title: 'Today API Cost',
+            value: formatMoneyPrecise(summary?.todayApiCost || 0),
+            detail: `Provider deductions ${formatMoneyPrecise(summary?.todayProviderDeductions || 0)}`,
+            tone: 'border-cyan-200 bg-cyan-50 text-cyan-700'
+        },
+        {
             title: 'Real Profit / Loss',
             value: formatMoneyPrecise(summary?.totalRealProfitLoss || 0),
-            detail: `${Number(summary?.refundedOrders || 0)} refunded orders`,
+            detail: `Today ${formatMoneyPrecise(summary?.todayRealProfitLoss || 0)} • ${Number(summary?.refundedOrders || 0)} refunded orders`,
             tone: Number(summary?.totalRealProfitLoss || 0) >= 0
                 ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
                 : 'border-rose-200 bg-rose-50 text-rose-700'
@@ -3232,14 +3306,14 @@ function renderAdminProviderSummary(summary) {
         {
             title: 'Risk Overview',
             value: `${Number(summary?.riskOrders || 0)} / ${Number(summary?.criticalOrders || 0)}`,
-            detail: `${Number(summary?.riskyUsers || 0)} risky users • ${Number(summary?.blockedUsers || 0)} blocked`,
+            detail: `${Number(summary?.riskyUsers || 0)} risky users • ${Number(summary?.blockedUsers || 0)} manually blocked`,
             tone: summary?.latestAnomalyFlag
                 ? 'border-rose-200 bg-rose-50 text-rose-700'
                 : 'border-slate-200 bg-slate-50 text-slate-700'
         }
     ];
     const headerMarkup = `
-        <div class="grid gap-3 xl:grid-cols-4">
+        <div class="grid gap-3 xl:grid-cols-5">
             ${cards.map((card) => `
                 <div class="rounded-2xl border p-4 ${card.tone}">
                     <div class="text-[11px] font-semibold uppercase tracking-[0.18em]">${escapeHtml(card.title)}</div>
@@ -3255,6 +3329,8 @@ function renderAdminProviderSummary(summary) {
             <div class="mt-1">Reason: ${escapeHtml(summary?.latestReconciliationReason || '—')}</div>
             <div class="mt-1">Unmatched delta: <strong>${escapeHtml(formatMoneyPrecise(summary?.latestUnmatchedDeltaPkr || 0))}</strong></div>
             <div class="mt-1">Website charge / refund: ${escapeHtml(formatMoneyPrecise(summary?.totalWebsiteCharge || 0))} / ${escapeHtml(formatMoneyPrecise(summary?.totalWebsiteRefund || 0))}</div>
+            <div class="mt-1">Today expected provider spend / actual deductions: ${escapeHtml(formatMoneyPrecise(summary?.todayExpectedProviderSpend || 0))} / ${escapeHtml(formatMoneyPrecise(summary?.todayProviderDeductions || 0))}</div>
+            <div class="mt-1 ${summary?.todayLossWarning ? 'font-semibold text-rose-700' : 'text-slate-600'}">${escapeHtml(summary?.todayLossWarning ? 'Warning: provider losses are higher than expected today.' : 'No excess provider-loss warning detected for today.')}</div>
         </div>
     `;
     container.innerHTML = `${headerMarkup}${reconciliationNote}`;
@@ -3323,22 +3399,27 @@ function renderAdminProviderSecurityEvents(events) {
             event.loss_detected ? 'Loss' : '',
             event.risk_flag ? 'Risk' : ''
         ].filter(Boolean).join(' • ') || 'Tracked';
+        const refundStatus = Number(event.website_refund || 0) > 0 ? `Refunded ${formatMoneyPrecise(event.website_refund || 0)}` : 'No refund';
         return `
             <tr class="border-b border-slate-200 align-top last:border-b-0 ${(event.critical_exploit || event.loss_detected) ? 'bg-rose-50/60' : ''}">
                 <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(formatRelativeTime(event.created_at))}</td>
                 <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(formatStatus(event.event_type || 'event'))}</td>
-                <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(event.username || event.phone_number || 'System')}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(event.order_id == null ? '—' : `#${event.order_id}`)}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(formatStatus(event.service_type || 'unknown'))}</td>
+                <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(event.phone_number || '—')}</td>
+                <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(event.username || 'System')}</td>
                 <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(event.reason || '—')}</td>
                 <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(event.provider_final_status || event.provider_status || '—')}</td>
-                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(event.real_provider_cost || 0))} / ${escapeHtml(formatMoneyPrecise(event.website_refund || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(event.real_provider_cost || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(refundStatus)}</td>
                 <td class="px-4 py-3 whitespace-nowrap font-semibold ${(event.critical_exploit || event.loss_detected) ? 'text-rose-700' : 'text-slate-700'}">${escapeHtml(flags)}</td>
             </tr>
         `;
     }).join('');
     container.innerHTML = renderAdminTable(
-        ['Time', 'Event', 'User / Phone', 'Reason', 'Provider Status', 'Cost / Refund', 'Flags'],
+        ['Time', 'Event', 'Order', 'Service', 'Number', 'User', 'Reason', 'Provider Status', 'Provider Deduction', 'Refund Status', 'Flags'],
         rows,
-        'min-w-[1180px]'
+        'min-w-[1480px]'
     );
 }
 
@@ -3684,12 +3765,18 @@ function renderAdminUsers(users) {
     }
     const rows = users.map((user) => {
         const roleLabel = user.is_admin ? 'Admin' : (user.role || 'user');
+        const riskStatus = user.security_risk_status || 'safe';
+        const riskReason = user.latest_security_reason || '—';
+        const providerLoss = Number(user.latest_provider_loss_amount || 0);
         return `
             <tr class="border-b border-slate-200 align-top last:border-b-0">
                 <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(user.name || 'Unnamed')}</td>
                 <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(user.email || 'Unknown email')}</td>
                 <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(user.balance))}</td>
                 <td class="px-4 py-3">${renderStatusBadge(roleLabel)}</td>
+                <td class="px-4 py-3">${renderStatusBadge(riskStatus)}</td>
+                <td class="px-4 py-3 text-slate-600">${escapeHtml(riskReason)}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold ${providerLoss > 0 ? 'text-rose-700' : 'text-slate-700'}">${escapeHtml(formatMoneyPrecise(providerLoss))}</td>
                 <td class="px-4 py-3">
                     <div class="flex flex-wrap gap-2">
                         <button class="inline-flex items-center gap-1 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100" data-action="adjust-user-balance" data-user-id="${escapeAttr(user.id)}" data-user-label="${escapeAttr(user.name || user.email || `User #${user.id}`)}">
@@ -3700,15 +3787,27 @@ function renderAdminUsers(users) {
                             <i class="fa-solid fa-clock-rotate-left"></i>
                             <span>History</span>
                         </button>
+                        <button class="inline-flex items-center gap-1 rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-100" data-action="admin-user-block" data-user-id="${escapeAttr(user.id)}" data-user-label="${escapeAttr(user.name || user.email || `User #${user.id}`)}">
+                            <i class="fa-solid fa-user-lock"></i>
+                            <span>Block</span>
+                        </button>
+                        <button class="inline-flex items-center gap-1 rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-1.5 text-xs font-semibold text-cyan-700 transition hover:bg-cyan-100" data-action="admin-user-unblock" data-user-id="${escapeAttr(user.id)}" data-user-label="${escapeAttr(user.name || user.email || `User #${user.id}`)}">
+                            <i class="fa-solid fa-unlock"></i>
+                            <span>Unblock</span>
+                        </button>
+                        <button class="inline-flex items-center gap-1 rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-700 transition hover:bg-amber-100" data-action="admin-user-remove-risk" data-user-id="${escapeAttr(user.id)}" data-user-label="${escapeAttr(user.name || user.email || `User #${user.id}`)}">
+                            <i class="fa-solid fa-shield-heart"></i>
+                            <span>Remove Risk</span>
+                        </button>
                     </div>
                 </td>
             </tr>
         `;
     }).join('');
     return renderAdminTable(
-        ['Name', 'Email', 'Balance', 'Role', 'Actions'],
+        ['Name', 'Email', 'Balance', 'Role', 'Risk', 'Reason', 'Provider Loss', 'Actions'],
         rows,
-        'min-w-[1080px]'
+        'min-w-[1480px]'
     );
 }
 
@@ -3928,6 +4027,21 @@ async function loadAdminData() {
         renderAdminProviderBalanceSnapshots(providerAnalytics?.recentBalanceSnapshots || []);
         renderAdminProviderSecurityEvents(providerAnalytics?.recentSecurityEvents || []);
         renderAdminProviderRiskUsers(providerAnalytics?.topRiskUsers || []);
+        const latestSecurityEvent = providerAnalytics?.recentSecurityEvents?.[0] || null;
+        if (latestSecurityEvent?.id != null) {
+            const latestSecurityEventId = Number(latestSecurityEvent.id || 0);
+            if (state.lastAdminSecurityEventId > 0 && latestSecurityEventId > state.lastAdminSecurityEventId) {
+                const orderText = latestSecurityEvent.order_id == null ? 'system event' : `order #${latestSecurityEvent.order_id}`;
+                const alertBody = latestSecurityEvent.reason === 'otp_or_sms_refunded'
+                    ? `OTP-after-refund detected on ${orderText}`
+                    : latestSecurityEvent.event_type === 'provider_reconciliation_anomaly'
+                        ? `Provider-loss mismatch detected: ${formatMoneyPrecise(latestSecurityEvent.real_provider_cost || 0)}`
+                        : `${formatStatus(latestSecurityEvent.event_type || latestSecurityEvent.reason || 'provider_alert')} on ${orderText}`;
+                showToast(alertBody, 'error', 12000);
+                browserNotify('MRF SMS Admin Alert', alertBody);
+            }
+            state.lastAdminSecurityEventId = Math.max(state.lastAdminSecurityEventId || 0, latestSecurityEventId);
+        }
         qs('admin-payment-requests-list').innerHTML = renderAdminPaymentRequests(pendingPaymentRequests, pendingTransactions);
         renderAdminOrders(orders);
         qs('admin-payment-history-list').innerHTML = renderAdminPaymentHistory(processedPaymentRequests);
@@ -3983,6 +4097,7 @@ async function refreshUserInfo() {
                 || state.activeOrder;
         }
         renderActiveOrders(orders);
+        syncInlineOrderPolling({ immediate: true });
         await loadPaymentHistory();
         await loadNumberHistory();
         await loadReferralProgram({ silent: true });
@@ -4917,6 +5032,18 @@ function bindStaticEvents() {
             await loadAdminUserHistory(actionTarget.dataset.userId, actionTarget.dataset.userLabel || 'User');
             return;
         }
+        if (action === 'admin-user-block') {
+            await promptAdminUserSecurityAction(actionTarget.dataset.userId, 'block', actionTarget.dataset.userLabel || 'User');
+            return;
+        }
+        if (action === 'admin-user-unblock') {
+            await promptAdminUserSecurityAction(actionTarget.dataset.userId, 'unblock', actionTarget.dataset.userLabel || 'User');
+            return;
+        }
+        if (action === 'admin-user-remove-risk') {
+            await promptAdminUserSecurityAction(actionTarget.dataset.userId, 'remove-risk', actionTarget.dataset.userLabel || 'User');
+            return;
+        }
         if (action === 'close-order-inline') {
             closeOrderModal();
             return;
@@ -4979,6 +5106,12 @@ function bindStaticEvents() {
         if (state.purchaseRequests.size) {
             updateProcessingModalState();
         }
+    });
+    window.addEventListener('focus', () => {
+        refreshOrdersOnVisibilityRestore();
+    });
+    document.addEventListener('visibilitychange', () => {
+        refreshOrdersOnVisibilityRestore();
     });
     window.addEventListener('beforeunload', () => {
         stopOrderIntervals();
