@@ -303,7 +303,8 @@ function normalizeUser(row) {
         login_attempts: row.login_attempts,
         security_risk_score: Number(row.security_risk_score || 0),
         security_risk_status: String(row.security_risk_status || 'safe').trim().toLowerCase() || 'safe',
-        security_blocked_until: row.security_blocked_until || null
+        security_blocked_until: row.security_blocked_until || null,
+        latest_provider_loss_amount: Number(row.latest_provider_loss_amount || 0)
     };
 }
 
@@ -311,6 +312,7 @@ function normalizeOrderStatus(row) {
     const rawStatus = String(row?.status || row?.order_status || '').toLowerCase();
     if (rawStatus === 'expired_refunded') return 'expired';
     if (rawStatus === 'refunded') return 'expired';
+    if (rawStatus === 'completed_waiting_user_action') return 'active';
     if (rawStatus === 'otp_received') return 'active';
     if (rawStatus === 'retry_requested') return (row?.otp_received || String(row?.otp_code || '').trim()) ? 'active' : 'pending';
     if (rawStatus === 'active' && !row?.otp_received && !String(row?.otp_code || '').trim()) return 'pending';
@@ -383,6 +385,16 @@ function hasStoredOtp(order) {
 
 function getRawOrderStatus(order) {
     return String(order?.status || order?.order_status || '').trim().toLowerCase();
+}
+
+function toIsoTimestamp(value, fallback = null) {
+    if (value == null || value === '') return fallback;
+    if (value instanceof Date) {
+        return Number.isNaN(value.getTime()) ? fallback : value.toISOString();
+    }
+    const candidate = new Date(value);
+    if (Number.isNaN(candidate.getTime())) return fallback;
+    return candidate.toISOString();
 }
 
 function isFinalOrderState(order) {
@@ -574,10 +586,6 @@ function evaluateOrderRiskFlags(order) {
     if (websiteRefund > 0 && isProviderNonPendingStatus(providerStatus)) {
         reasons.push('provider_non_pending_refunded');
         details.push('Provider reported a non-pending state while the website refunded the user.');
-    }
-    if (Number(order?.post_close_poll_count || 0) >= SECURITY_POST_CLOSE_POLL_LIMIT) {
-        reasons.push('multiple_refreshes_after_close');
-        details.push('Repeated OTP polling/refresh attempts were detected after the order was closed.');
     }
     if (realProviderCost > 0 && websiteCharge <= 0) {
         reasons.push('provider_charged_without_website_charge');
@@ -1886,7 +1894,7 @@ async function getOrdersByUser(userId) {
         SELECT *
         FROM orders
         WHERE user_id = $1
-          AND COALESCE(status, order_status, 'pending') IN ('pending', 'active')
+          AND COALESCE(status, order_status, 'pending') IN ('pending', 'active', 'completed_waiting_user_action')
           AND LOWER(COALESCE(status, 'pending')) NOT IN ('completed', 'cancelled', 'expired', 'expired_refunded')
           AND LOWER(COALESCE(order_status, 'pending')) NOT IN ('completed', 'cancelled', 'expired', 'expired_refunded')
         ORDER BY id DESC
@@ -1897,19 +1905,44 @@ async function getOrdersByUser(userId) {
 async function getAdminUsers() {
     const rows = await queryAll(`
         SELECT
-            id,
-            name,
-            email,
-            balance,
-            role,
-            is_admin,
-            created_at,
-            security_risk_score,
-            security_risk_status,
-            security_blocked_until,
-            security_last_flagged_at
-        FROM users
-        ORDER BY id DESC
+            u.id,
+            u.name,
+            u.email,
+            u.balance,
+            u.role,
+            u.is_admin,
+            u.created_at,
+            u.security_risk_score,
+            u.security_risk_status,
+            u.security_blocked_until,
+            u.security_last_flagged_at,
+            latest_event.reason AS latest_security_reason,
+            latest_event.created_at AS latest_security_event_at,
+            latest_event.order_id AS latest_security_order_id,
+            latest_event.service_type AS latest_security_service,
+            latest_event.phone_number AS latest_security_number,
+            GREATEST(COALESCE(-latest_event.real_profit_loss, 0), COALESCE(latest_event.real_provider_cost, 0), 0)::numeric AS latest_provider_loss_amount
+        FROM users u
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM provider_security_events pse
+            WHERE pse.user_id = u.id
+              AND (
+                  pse.reason IN (
+                      'otp_or_sms_refunded',
+                      'provider_cost_refunded',
+                      'provider_non_pending_refunded',
+                      'cancelled_after_provider_use',
+                      'provider_charged_without_website_charge'
+                  )
+                  OR pse.risk_flag = TRUE
+                  OR pse.loss_detected = TRUE
+                  OR pse.critical_exploit = TRUE
+              )
+            ORDER BY pse.created_at DESC, pse.id DESC
+            LIMIT 1
+        ) latest_event ON TRUE
+        ORDER BY u.id DESC
     `);
     return rows.map(normalizeUser);
 }
@@ -2001,9 +2034,9 @@ function buildNumberHistorySnapshot(order, options = {}) {
         return null;
     }
     const lifecycleStatus = normalizeOrderStatus(normalizedOrder);
-    const eventAt = String(options.eventAt || new Date().toISOString());
-    const finalizedAt = String(options.finalizedAt || normalizedOrder.completed_at || eventAt);
-    const otpReceivedAt = String(options.otpReceivedAt || normalizedOrder.completed_at || eventAt);
+    const eventAt = toIsoTimestamp(options.eventAt, new Date().toISOString());
+    const finalizedAt = toIsoTimestamp(options.finalizedAt, toIsoTimestamp(normalizedOrder.completed_at, eventAt));
+    const otpReceivedAt = toIsoTimestamp(options.otpReceivedAt, toIsoTimestamp(normalizedOrder.sms_received_at, toIsoTimestamp(normalizedOrder.completed_at, eventAt)));
     const otpCode = String(normalizedOrder.otp_code || '').trim();
     const hasOtp = Boolean(normalizedOrder.otp_received || otpCode);
     return {
@@ -2022,10 +2055,10 @@ function buildNumberHistorySnapshot(order, options = {}) {
         otp_code: otpCode || null,
         status: lifecycleStatus,
         order_status: String(normalizedOrder.order_status || lifecycleStatus || '').trim().toLowerCase() || lifecycleStatus,
-        purchased_at: normalizedOrder.created_at || eventAt,
+        purchased_at: toIsoTimestamp(normalizedOrder.created_at, eventAt),
         otp_received_at: hasOtp ? otpReceivedAt : null,
         final_status_at: ['completed', 'cancelled', 'expired'].includes(lifecycleStatus) ? finalizedAt : null,
-        completed_at: lifecycleStatus === 'completed' ? (normalizedOrder.completed_at || finalizedAt) : null,
+        completed_at: lifecycleStatus === 'completed' ? toIsoTimestamp(normalizedOrder.completed_at, finalizedAt) : null,
         cancelled_at: lifecycleStatus === 'cancelled' ? finalizedAt : null,
         expired_at: lifecycleStatus === 'expired' ? finalizedAt : null,
         last_event_at: eventAt
@@ -2141,6 +2174,67 @@ async function applyAdminBalanceAdjustment({ userId, adminId, amount, reason }) 
 
         await client.query('COMMIT');
         return normalizeUser(updatedUser);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
+async function applyAdminUserSecurityAction({ userId, action, reason, hours }) {
+    const normalizedUserId = Number(userId);
+    if (!Number.isFinite(normalizedUserId) || normalizedUserId <= 0) {
+        throw new Error('Invalid user id');
+    }
+    const normalizedAction = String(action || '').trim().toLowerCase();
+    if (!['block', 'unblock', 'remove-risk'].includes(normalizedAction)) {
+        throw new Error('Invalid security action');
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [normalizedUserId]);
+        const user = normalizeUser(userRes.rows[0]);
+        if (!user) throw new Error('User not found');
+        let blockedUntil = user.security_blocked_until || null;
+        let riskScore = Number(user.security_risk_score || 0);
+        let riskStatus = String(user.security_risk_status || 'safe').trim().toLowerCase() || 'safe';
+        if (normalizedAction === 'block') {
+            const blockHours = Math.max(1, Math.min(720, Number(hours || 24)));
+            blockedUntil = new Date(Date.now() + blockHours * 60 * 60 * 1000).toISOString();
+            riskScore = Math.max(riskScore, 80);
+            riskStatus = 'dangerous';
+        } else if (normalizedAction === 'unblock') {
+            blockedUntil = null;
+            if (riskStatus === 'dangerous' && riskScore >= 80) {
+                riskStatus = riskScore > 0 ? 'suspicious' : 'safe';
+            }
+        } else if (normalizedAction === 'remove-risk') {
+            blockedUntil = null;
+            riskScore = 0;
+            riskStatus = 'safe';
+        }
+        const result = await client.query(`
+            UPDATE users
+            SET security_risk_score = $1,
+                security_risk_status = $2,
+                security_blocked_until = $3,
+                security_last_flagged_at = CASE WHEN $1 > 0 THEN COALESCE(security_last_flagged_at, CURRENT_TIMESTAMP) ELSE security_last_flagged_at END
+            WHERE id = $4
+            RETURNING *
+        `, [
+            riskScore,
+            riskStatus,
+            blockedUntil,
+            normalizedUserId
+        ]);
+        await client.query('COMMIT');
+        return {
+            user: normalizeUser(result.rows[0]),
+            action: normalizedAction,
+            reason: String(reason || '').trim() || null
+        };
     } catch (err) {
         await client.query('ROLLBACK');
         throw err;
@@ -2341,26 +2435,25 @@ async function getUserSecurityMetrics(userId, options = {}) {
     const metricsRes = await executor.query(`
         SELECT
             COUNT(*) FILTER (
-                WHERE event_type = 'cancel_refund_completed'
-                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
-            )::int AS cancellations_last_hour,
-            COUNT(*) FILTER (
-                WHERE event_type IN ('cancel_refund_completed', 'expire_refund_completed')
-                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '1 day'
-            )::int AS refunds_today,
-            COUNT(*) FILTER (
-                WHERE risk_flag = TRUE
-                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+                WHERE reason IN (
+                    'otp_or_sms_refunded',
+                    'provider_cost_refunded',
+                    'provider_non_pending_refunded',
+                    'cancelled_after_provider_use',
+                    'provider_charged_without_website_charge'
+                )
+                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'
             )::int AS suspicious_recent,
             COUNT(*) FILTER (
-                WHERE event_type = 'post_close_otp_poll'
+                WHERE reason = 'otp_or_sms_refunded'
             )::int AS otp_after_cancel_attempts,
             COUNT(*) FILTER (
                 WHERE reason IN (
                     'otp_or_sms_refunded',
                     'provider_cost_refunded',
                     'provider_non_pending_refunded',
-                    'cancelled_after_provider_use'
+                    'cancelled_after_provider_use',
+                    'provider_charged_without_website_charge'
                 )
             )::int AS refund_abuse_count,
             COUNT(*) FILTER (
@@ -2370,19 +2463,17 @@ async function getUserSecurityMetrics(userId, options = {}) {
         WHERE user_id = $1
     `, [normalizedUserId]);
     const row = metricsRes.rows[0] || {};
-    const cancellationsLastHour = Number(row.cancellations_last_hour || 0);
-    const refundsToday = Number(row.refunds_today || 0);
+    const cancellationsLastHour = 0;
+    const refundsToday = 0;
     const suspiciousRecent = Number(row.suspicious_recent || 0);
     const otpAfterCancelAttempts = Number(row.otp_after_cancel_attempts || 0);
     const refundAbuseCount = Number(row.refund_abuse_count || 0);
     const criticalTotal = Number(row.critical_total || 0);
     const riskScore = (
-        refundAbuseCount * 25
-        + otpAfterCancelAttempts * 20
-        + suspiciousRecent * 15
-        + criticalTotal * 50
-        + Math.max(0, cancellationsLastHour - SECURITY_MAX_CANCELLATIONS_PER_HOUR + 1) * 10
-        + Math.max(0, refundsToday - SECURITY_MAX_REFUNDS_PER_DAY + 1) * 10
+        refundAbuseCount * 35
+        + otpAfterCancelAttempts * 25
+        + suspiciousRecent * 20
+        + criticalTotal * 40
     );
     return {
         user,
@@ -2403,12 +2494,7 @@ async function syncUserSecurityState(userId, options = {}) {
     const executor = options.client || pool;
     const now = new Date();
     const existingBlockedUntil = metrics.user?.security_blocked_until ? new Date(metrics.user.security_blocked_until) : null;
-    let blockedUntil = existingBlockedUntil && existingBlockedUntil > now ? existingBlockedUntil : null;
-    if (metrics.criticalTotal > 0 || metrics.suspiciousRecent >= SECURITY_MAX_SUSPICIOUS_ACTIONS) {
-        blockedUntil = new Date(now.getTime() + SECURITY_AUTO_BLOCK_HOURS * 60 * 60 * 1000);
-    } else if (metrics.cancellationsLastHour >= SECURITY_MAX_CANCELLATIONS_PER_HOUR || metrics.refundsToday >= SECURITY_MAX_REFUNDS_PER_DAY) {
-        blockedUntil = new Date(now.getTime() + SECURITY_CANCEL_COOLDOWN_MINUTES * 60 * 1000);
-    }
+    const blockedUntil = existingBlockedUntil && existingBlockedUntil > now ? existingBlockedUntil : null;
     const blockedUntilIso = blockedUntil ? blockedUntil.toISOString() : null;
     const result = await executor.query(`
         UPDATE users
@@ -2542,14 +2628,13 @@ async function registerClosedOrderAccess(order, details = {}, options = {}) {
     const normalizedOrder = normalizeOrder(order);
     if (!normalizedOrder?.id) return null;
     const nextPollCount = Number(normalizedOrder.post_close_poll_count || 0) + 1;
-    const shouldFlag = nextPollCount >= SECURITY_POST_CLOSE_POLL_LIMIT;
     return syncOrderFinancialProtection(normalizedOrder, {
         postClosePollCount: nextPollCount,
         securityEventType: details.eventType || 'post_close_otp_poll',
-        reason: shouldFlag ? 'multiple_refreshes_after_close' : String(details.reason || '').trim() || 'closed_order_access',
-        recordRiskEvent: shouldFlag,
+        reason: String(details.reason || '').trim() || 'closed_order_access',
+        recordRiskEvent: false,
         syncNumberHistory: false,
-        syncUserRisk: shouldFlag,
+        syncUserRisk: false,
         eventAt: details.eventAt || new Date().toISOString()
     }, options);
 }
@@ -2560,40 +2645,14 @@ async function assertUserNotSecurityBlocked(userId, options = {}) {
         throw new Error('User not found');
     }
     if (metrics.blockedUntil && new Date(metrics.blockedUntil) > new Date()) {
-        throw new Error('Account temporarily blocked due to suspicious activity. Please contact support.');
+        throw new Error('Account is currently blocked for manual admin review. Please contact support.');
     }
     return metrics;
 }
 
 async function enforceCancelSecurityLimits(userId, order, options = {}) {
-    const metrics = await assertUserNotSecurityBlocked(userId, options);
-    if (metrics.cancellationsLastHour >= SECURITY_MAX_CANCELLATIONS_PER_HOUR) {
-        await insertProviderSecurityEvent(order, {
-            eventType: 'cancel_rate_limit_blocked',
-            reason: 'cancel_rate_limit_exceeded',
-            riskFlag: true,
-            lossDetected: false,
-            criticalExploit: false
-        }, {
-            client: options.client
-        });
-        await syncUserSecurityState(userId, options);
-        throw new Error(`Too many cancellations. Please wait ${SECURITY_CANCEL_COOLDOWN_MINUTES} minutes before trying again.`);
-    }
-    if (metrics.refundsToday >= SECURITY_MAX_REFUNDS_PER_DAY) {
-        await insertProviderSecurityEvent(order, {
-            eventType: 'refund_rate_limit_blocked',
-            reason: 'refund_rate_limit_exceeded',
-            riskFlag: true,
-            lossDetected: false,
-            criticalExploit: false
-        }, {
-            client: options.client
-        });
-        await syncUserSecurityState(userId, options);
-        throw new Error('Refund limit reached for today. Please contact support if this is unexpected.');
-    }
-    return metrics;
+    void order;
+    return assertUserNotSecurityBlocked(userId, options);
 }
 
 async function updateProviderActivationStatus(activationId, status) {
@@ -2681,7 +2740,7 @@ async function syncOrderWithProviderSignal(order, providerSignal, options = {}) 
     if (!order || order.id == null || !providerSignal?.providerReportedNonPending) {
         return normalizeOrder(order);
     }
-    const eventAt = String(options.eventAt || new Date().toISOString());
+    const eventAt = toIsoTimestamp(options.eventAt, new Date().toISOString());
     const updates = {
         sms_received: true,
         sms_received_at: eventAt,
@@ -2696,8 +2755,8 @@ async function syncOrderWithProviderSignal(order, providerSignal, options = {}) 
     if (providerSignal.hasCode) {
         updates.otp_received = true;
         updates.otp_code = providerSignal.code;
-        updates.order_status = 'active';
-        updates.status = 'active';
+        updates.order_status = 'completed_waiting_user_action';
+        updates.status = 'completed_waiting_user_action';
     }
     const updatedOrder = await updateOrder(order.id, updates, {
         client: options.client,
@@ -2724,6 +2783,66 @@ async function syncOrderWithProviderSignal(order, providerSignal, options = {}) 
     }, {
         client: options.client
     });
+}
+
+async function syncOrderForProviderDisplay(order, options = {}) {
+    const normalizedOrder = normalizeOrder(order);
+    if (!normalizedOrder?.id || !normalizedOrder.activation_id || hasStoredOtp(normalizedOrder) || isFinalOrderState(normalizedOrder)) {
+        return normalizedOrder;
+    }
+    const lifecycleStatus = normalizeOrderStatus(normalizedOrder);
+    if (!['pending', 'active'].includes(lifecycleStatus)) {
+        return normalizedOrder;
+    }
+    const eventAt = toIsoTimestamp(options.eventAt, new Date().toISOString());
+    try {
+        const providerSignal = analyzeProviderSmsResult(await checkSmsStatus(normalizedOrder.activation_id));
+        if (providerSignal.providerValidationFailed || providerSignal.providerPending || providerSignal.providerCancelled || !providerSignal.providerReportedNonPending) {
+            return normalizedOrder;
+        }
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const lockedOrderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [normalizedOrder.id]);
+            const lockedOrder = normalizeOrder(lockedOrderRes.rows[0]);
+            if (!lockedOrder) {
+                await client.query('ROLLBACK');
+                return normalizedOrder;
+            }
+            if (!lockedOrder.activation_id || hasStoredOtp(lockedOrder) || isFinalOrderState(lockedOrder)) {
+                await client.query('COMMIT');
+                return lockedOrder;
+            }
+            const syncedOrder = await syncOrderWithProviderSignal(lockedOrder, providerSignal, {
+                client,
+                eventAt,
+                otpReceivedAt: providerSignal.hasCode ? eventAt : options.otpReceivedAt,
+                syncNumberHistory: true
+            });
+            await client.query('COMMIT');
+            return syncedOrder;
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
+    } catch (err) {
+        logProviderAudit('display_order_provider_sync_failed', {
+            orderId: normalizedOrder.id,
+            activationId: normalizedOrder.activation_id,
+            error: formatSafeError(err, 'Provider display sync failed')
+        });
+        return normalizedOrder;
+    }
+}
+
+async function syncUserOrdersForProviderDisplay(orders, options = {}) {
+    const syncedOrders = [];
+    for (const order of Array.isArray(orders) ? orders : []) {
+        syncedOrders.push(await syncOrderForProviderDisplay(order, options));
+    }
+    return syncedOrders;
 }
 
 async function expireOrderAndRefund(orderId) {
@@ -2826,14 +2945,17 @@ async function expireOrderAndRefund(orderId) {
                 : null
         });
         const previousProviderCostCurrency = roundMoney(order.real_provider_cost_provider_currency || 0, 6);
+        const providerCostAlreadyClear = previousProviderCostCurrency <= PROVIDER_BALANCE_EPSILON
+            && getRealProviderCostAmount(order) <= PROVIDER_BALANCE_EPSILON;
         const providerRefundVerified = !order.activation_id
+            || providerCostAlreadyClear
             || (providerRecovery.balanceVerified && expireCancelResult.success);
-        const remainingProviderCostCurrency = providerRefundVerified
-            ? providerRecovery.remainingCurrency
-            : previousProviderCostCurrency;
-        const remainingProviderCostPkr = providerRefundVerified
-            ? providerRecovery.remainingPkr
-            : getRealProviderCostAmount(order);
+        const remainingProviderCostCurrency = providerCostAlreadyClear
+            ? 0
+            : (providerRefundVerified ? providerRecovery.remainingCurrency : previousProviderCostCurrency);
+        const remainingProviderCostPkr = providerCostAlreadyClear
+            ? 0
+            : (providerRefundVerified ? providerRecovery.remainingPkr : getRealProviderCostAmount(order));
         const refundAllowed = providerRefundVerified && remainingProviderCostCurrency <= PROVIDER_BALANCE_EPSILON;
         const walletRefundAmount = refundAllowed && user ? Number(order.price || 0) : 0;
         if (walletRefundAmount > 0 && user) {
@@ -3002,7 +3124,7 @@ async function getAdminProviderAnalytics(options = {}) {
     const snapshotLimit = Math.max(5, Math.min(100, Number(options.snapshotLimit || 20)));
     const eventLimit = Math.max(5, Math.min(100, Number(options.eventLimit || 25)));
     const topRiskUserLimit = Math.max(5, Math.min(50, Number(options.topRiskUserLimit || 15)));
-    const [orderSummaryRow, userSummaryRow, latestSnapshotRow, serviceBreakdownRows, recentSnapshotRows, recentEventRows, topRiskUserRows] = await Promise.all([
+    const [orderSummaryRow, userSummaryRow, latestSnapshotRow, serviceBreakdownRows, recentSnapshotRows, recentEventRows, topRiskUserRows, todayOrderSummaryRow, todayProviderBalanceRow] = await Promise.all([
         queryOne(`
             SELECT
                 COUNT(*)::int AS total_orders,
@@ -3022,7 +3144,8 @@ async function getAdminProviderAnalytics(options = {}) {
             SELECT
                 COUNT(*) FILTER (WHERE security_risk_status <> 'safe')::int AS risky_users,
                 COUNT(*) FILTER (WHERE security_blocked_until > CURRENT_TIMESTAMP)::int AS blocked_users,
-                COALESCE(MAX(security_risk_score), 0)::numeric AS max_risk_score
+                COALESCE(MAX(security_risk_score), 0)::numeric AS max_risk_score,
+                COALESCE(SUM(balance), 0)::numeric AS total_user_balances
             FROM users
         `),
         queryOne(`
@@ -3052,6 +3175,10 @@ async function getAdminProviderAnalytics(options = {}) {
         queryAll(`
             SELECT *
             FROM provider_security_events
+            WHERE risk_flag = TRUE
+               OR loss_detected = TRUE
+               OR critical_exploit = TRUE
+               OR event_type = 'provider_reconciliation_anomaly'
             ORDER BY created_at DESC, id DESC
             LIMIT $1
         `, [eventLimit]),
@@ -3071,10 +3198,50 @@ async function getAdminProviderAnalytics(options = {}) {
                OR COALESCE(security_risk_status, 'safe') <> 'safe'
             ORDER BY COALESCE(security_risk_score, 0) DESC, security_blocked_until DESC NULLS LAST, id DESC
             LIMIT $1
-        `, [topRiskUserLimit])
+        `, [topRiskUserLimit]),
+        queryOne(`
+            SELECT
+                COALESCE(SUM(real_provider_cost) FILTER (
+                    WHERE created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                ), 0)::numeric AS today_api_cost,
+                COALESCE(SUM(real_profit_loss) FILTER (
+                    WHERE created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                ), 0)::numeric AS today_real_profit_loss
+            FROM orders
+        `),
+        queryOne(`
+            SELECT
+                COALESCE(SUM(GREATEST(delta_pkr, 0)) FILTER (
+                    WHERE created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                      AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                ), 0)::numeric AS today_provider_deductions,
+                COALESCE(SUM(expected_spend_pkr) FILTER (
+                    WHERE created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                      AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                ), 0)::numeric AS today_expected_provider_spend,
+                COALESCE(SUM(unmatched_delta_pkr) FILTER (
+                    WHERE created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                      AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                ), 0)::numeric AS today_unmatched_provider_delta,
+                COUNT(*) FILTER (
+                    WHERE created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                      AND anomaly_flag = TRUE
+                )::int AS today_anomaly_count
+            FROM provider_balance_snapshots
+        `)
     ]);
 
     const latestSnapshot = normalizeProviderBalanceSnapshotEntry(latestSnapshotRow);
+    const todayProviderDeductions = Number(todayProviderBalanceRow?.today_provider_deductions || 0);
+    const todayExpectedProviderSpend = Number(todayProviderBalanceRow?.today_expected_provider_spend || 0);
+    const todayUnmatchedProviderDelta = Number(todayProviderBalanceRow?.today_unmatched_provider_delta || 0);
+    const todayLossWarning = todayProviderDeductions > (todayExpectedProviderSpend + Math.max(50, Math.abs(todayExpectedProviderSpend) * 0.25));
     return {
         summary: {
             totalOrders: Number(orderSummaryRow?.total_orders || 0),
@@ -3091,6 +3258,14 @@ async function getAdminProviderAnalytics(options = {}) {
             riskyUsers: Number(userSummaryRow?.risky_users || 0),
             blockedUsers: Number(userSummaryRow?.blocked_users || 0),
             maxRiskScore: Number(userSummaryRow?.max_risk_score || 0),
+            totalUserBalances: Number(userSummaryRow?.total_user_balances || 0),
+            todayApiCost: Number(todayOrderSummaryRow?.today_api_cost || 0),
+            todayProviderDeductions,
+            todayRealProfitLoss: Number(todayOrderSummaryRow?.today_real_profit_loss || 0),
+            todayExpectedProviderSpend,
+            todayUnmatchedProviderDelta,
+            todayAnomalyCount: Number(todayProviderBalanceRow?.today_anomaly_count || 0),
+            todayLossWarning,
             latestProviderBalance: latestSnapshot?.provider_balance ?? null,
             latestProviderBalanceCurrency: latestSnapshot?.provider_balance == null ? PROVIDER_BALANCE_CURRENCY : (latestSnapshot?.provider_balance_currency || PROVIDER_BALANCE_CURRENCY),
             latestReconciliationAt: latestSnapshot?.created_at || null,
@@ -3206,7 +3381,7 @@ async function updateUserLastLogin(userId) {
 }
 
 const whatsappCountries = [
-    { name: 'South Africa', code: '+27', price: 35, countryId: 31, flag: '🇿🇦' },
+    { name: 'South Africa', code: '+27', price: 80, countryId: 31, flag: '🇿🇦' },
     { name: 'Indonesia', code: '+62', price: 170, countryId: 6, flag: '🇮🇩' },
     { name: 'Canada', code: '+1', price: 170, countryId: 36, flag: '🇨🇦' },
     { name: 'Philippines', code: '+63', price: 190, countryId: 4, flag: '🇵🇭' },
@@ -3215,10 +3390,9 @@ const whatsappCountries = [
     { name: 'Colombia', code: '+57', price: 240, countryId: 33, flag: '🇨🇴' },
     { name: 'Saudi Arabia', code: '+966', price: 240, countryId: 53, flag: '🇸🇦' },
     { name: 'Brazil', code: '+55', price: 370, countryId: 73, flag: '🇧🇷' },
-    { name: 'USA', code: '+1', price: 470, countryId: 187, flag: '🇺🇸' },
+    { name: 'USA', code: '+1', price: 370, countryId: 187, flag: '🇺🇸' },
     { name: 'United Kingdom', code: '+44', price: 300, countryId: 16, flag: '🇬🇧' },
     { name: 'Chile', code: '+56', price: 68.07, countryId: 151, flag: '🇨🇱' },
-    { name: 'India', code: '+91', price: 390, countryId: 22, flag: '🇮🇳' },
     { name: 'Peru', code: '+51', price: 122.67, countryId: 65, flag: '🇵🇪' },
     { name: 'Hong Kong', code: '+852', price: 122.67, countryId: 14, flag: '🇭🇰' },
     { name: 'Argentina', code: '+54', price: 122.67, countryId: 39, flag: '🇦🇷' },
@@ -9356,6 +9530,29 @@ app.post('/api/admin/users/:userId/adjust-balance', ensureAdmin, async (req, res
     }
 });
 
+app.post('/api/admin/users/:userId/security-action', ensureAdmin, async (req, res) => {
+    try {
+        const targetUserId = Number(req.params.userId);
+        const action = String(req.body.action || '').trim().toLowerCase();
+        const reason = String(req.body.reason || '').trim();
+        const hours = Number(req.body.hours || 24);
+        const result = await applyAdminUserSecurityAction({
+            userId: targetUserId,
+            action,
+            reason,
+            hours
+        });
+        res.json({
+            success: true,
+            action: result.action,
+            reason: result.reason,
+            user: result.user
+        });
+    } catch (err) {
+        res.status(400).send(formatSafeError(err, 'User security action failed'));
+    }
+});
+
 app.get('/api/admin/users/:userId/history', ensureAdmin, async (req, res) => {
     try {
         const targetUserId = Number(req.params.userId);
@@ -9610,7 +9807,7 @@ app.post('/api/order', ensureAuth, async (req, res) => {
                 SELECT COUNT(*)::int AS total
                 FROM orders
                 WHERE user_id = $1
-                  AND COALESCE(status, order_status, 'pending') IN ('pending', 'active')
+                  AND COALESCE(status, order_status, 'pending') IN ('pending', 'active', 'completed_waiting_user_action')
             `,
             [user.id]
         );
@@ -9744,6 +9941,7 @@ app.get('/api/orders/:orderId', ensureAuth, async (req, res) => {
             await expireOrderAndRefund(order.id);
             order = await getOrderById(order.id);
         }
+        order = await syncOrderForProviderDisplay(order);
         res.json(order);
     } catch {
         res.status(500).send('Server error');
@@ -9753,7 +9951,7 @@ app.get('/api/orders/:orderId', ensureAuth, async (req, res) => {
 app.get('/api/orders', ensureAuth, async (req, res) => {
     try {
         await reconcileExpiredOrdersForUser(req.session.userId);
-        const userOrders = await getOrdersByUser(req.session.userId);
+        const userOrders = await syncUserOrdersForProviderDisplay(await getOrdersByUser(req.session.userId));
         res.json(userOrders);
     } catch {
         res.status(500).send('Server error');
@@ -9853,14 +10051,17 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
                 : null
         });
         const previousProviderCostCurrency = roundMoney(order.real_provider_cost_provider_currency || 0, 6);
+        const providerCostAlreadyClear = previousProviderCostCurrency <= PROVIDER_BALANCE_EPSILON
+            && getRealProviderCostAmount(order) <= PROVIDER_BALANCE_EPSILON;
         const providerRefundVerified = !order.activation_id
+            || providerCostAlreadyClear
             || (providerRecovery.balanceVerified && cancelResult.success);
-        const remainingProviderCostCurrency = providerRefundVerified
-            ? providerRecovery.remainingCurrency
-            : previousProviderCostCurrency;
-        const remainingProviderCostPkr = providerRefundVerified
-            ? providerRecovery.remainingPkr
-            : getRealProviderCostAmount(order);
+        const remainingProviderCostCurrency = providerCostAlreadyClear
+            ? 0
+            : (providerRefundVerified ? providerRecovery.remainingCurrency : previousProviderCostCurrency);
+        const remainingProviderCostPkr = providerCostAlreadyClear
+            ? 0
+            : (providerRefundVerified ? providerRecovery.remainingPkr : getRealProviderCostAmount(order));
         const refundAllowed = providerRefundVerified && remainingProviderCostCurrency <= PROVIDER_BALANCE_EPSILON;
         const walletRefundAmount = refundAllowed ? Number(order.price || 0) : 0;
         if (walletRefundAmount > 0) {
