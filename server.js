@@ -370,6 +370,7 @@ function normalizeOrder(row) {
         exploit_reason: String(row.exploit_reason || '').trim() || null,
         exploit_reason_detail: String(row.exploit_reason_detail || '').trim() || null,
         refunded_at: row.refunded_at || null,
+        refund_processing_at: row.refund_processing_at || null,
         refund_locked_at: row.refund_locked_at || (providerUsed ? (row.sms_received_at || row.completed_at || row.created_at || null) : null),
         post_close_poll_count: Number(row.post_close_poll_count || 0),
         duplicate_cancel_attempts: Number(row.duplicate_cancel_attempts || 0),
@@ -402,22 +403,36 @@ function isFinalOrderState(order) {
     return ['completed', 'cancelled', 'expired'].includes(lifecycleStatus) || ORDER_FINAL_STATUSES.has(getRawOrderStatus(order));
 }
 
+function isProviderSuccessStatus(status) {
+    const normalizedStatus = String(status || '').trim().toUpperCase();
+    return Boolean(normalizedStatus)
+        && (
+            normalizedStatus.startsWith('STATUS_OK')
+            || /(^|[_\s-])SUCCESS($|[_\s-])/.test(normalizedStatus)
+            || /(^|[_\s-])COMPLETED($|[_\s-])/.test(normalizedStatus)
+        );
+}
+
 function logOrderHotfixEvent(eventName, order, details = {}) {
     console.info(ORDER_HOTFIX_AUDIT_PREFIX, {
         event: eventName,
         timestamp: new Date().toISOString(),
         orderId: order?.id ?? null,
         userId: order?.user_id ?? null,
+        username: String(details.username || getOrderUsernameSnapshot(order) || '').trim() || null,
         service: String(order?.service_type || order?.service_name || '').trim() || null,
         number: String(order?.phone_number || '').trim() || null,
         activationId: String(order?.activation_id || '').trim() || null,
         status: getRawOrderStatus(order) || null,
         smsReceived: Boolean(order?.sms_received),
         otpReceived: hasStoredOtp(order),
+        otpExisted: details.otpExisted ?? hasStoredOtp(order),
+        refunded: details.refunded ?? Boolean(details.refundTime),
         cancelTime: details.cancelTime || null,
         otpArrivalTime: details.otpArrivalTime || null,
         refundTime: details.refundTime || null,
         providerStatus: details.providerStatus || null,
+        providerSuccess: details.providerSuccess ?? isProviderSuccessStatus(details.providerStatus || getProviderOrderStatus(order)),
         providerError: details.providerError || null,
         reason: details.reason || null
     });
@@ -425,6 +440,10 @@ function logOrderHotfixEvent(eventName, order, details = {}) {
 
 function getOrderUsernameSnapshot(order) {
     return String(order?.username_snapshot || order?.user_name || order?.name || '').trim() || null;
+}
+
+function getAuditUsername(user, order) {
+    return String(user?.name || user?.email || user?.username || getOrderUsernameSnapshot(order) || '').trim() || null;
 }
 
 function isProviderNonPendingStatus(status) {
@@ -437,6 +456,63 @@ function isProviderNonPendingStatus(status) {
 
 function getProviderOrderStatus(order) {
     return String(order?.provider_final_status || order?.provider_status || order?.provider_last_status || '').trim() || null;
+}
+
+function buildRefundDecision(order, providerSignal = null) {
+    const providerStatus = String(providerSignal?.rawStatus || getProviderOrderStatus(order) || '').trim() || null;
+    const websiteOtpExists = hasStoredOtp(order);
+    const providerOtpExists = Boolean(providerSignal?.hasCode);
+    const providerSuccess = isProviderSuccessStatus(providerStatus);
+    const otpExists = websiteOtpExists || providerOtpExists;
+    let reason = 'no_otp_provider_not_success';
+    if (websiteOtpExists) {
+        reason = 'otp_exists_in_database';
+    } else if (providerOtpExists) {
+        reason = 'otp_received_from_provider';
+    } else if (providerSuccess) {
+        reason = 'provider_marked_success_completed';
+    }
+    return {
+        providerStatus,
+        websiteOtpExists,
+        providerOtpExists,
+        otpExists,
+        providerSuccess,
+        refundAllowed: !otpExists && !providerSuccess,
+        reason
+    };
+}
+
+function getRefundBlockedMessage(decision, actionType = 'refund') {
+    if (decision?.providerOtpExists || decision?.websiteOtpExists || decision?.otpExists) {
+        return actionType === 'cancel'
+            ? 'OTP already received, cannot cancel'
+            : 'OTP already received. Refund blocked.';
+    }
+    if (decision?.providerSuccess) {
+        return actionType === 'cancel'
+            ? 'Provider marked success/completed, cannot cancel'
+            : 'Provider marked success/completed. Refund blocked.';
+    }
+    return actionType === 'cancel'
+        ? 'Cancel temporarily locked while activation status is being verified.'
+        : 'Refund temporarily locked while activation status is being verified.';
+}
+
+function isRefundProcessing(order) {
+    if (!order?.refund_processing_at || isFinalOrderState(order)) return false;
+    const startedAt = new Date(order.refund_processing_at);
+    if (Number.isNaN(startedAt.getTime())) return false;
+    return (Date.now() - startedAt.getTime()) < 120000;
+}
+
+async function setRefundProcessingState(orderId, refundProcessingAt, client) {
+    return updateOrder(orderId, {
+        refund_processing_at: refundProcessingAt || null
+    }, {
+        client,
+        syncNumberHistory: false
+    });
 }
 
 function isProviderUsedOrder(order) {
@@ -1018,6 +1094,7 @@ async function initDB() {
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS exploit_reason TEXT');
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS exploit_reason_detail TEXT');
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ');
+    await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_processing_at TIMESTAMPTZ');
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_locked_at TIMESTAMPTZ');
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS post_close_poll_count INTEGER DEFAULT 0');
     await queryRun('ALTER TABLE orders ADD COLUMN IF NOT EXISTS duplicate_cancel_attempts INTEGER DEFAULT 0');
@@ -2736,6 +2813,35 @@ function analyzeProviderSmsResult(result) {
     };
 }
 
+async function verifyRefundEligibilityWithProvider(order) {
+    const normalizedOrder = normalizeOrder(order);
+    if (!normalizedOrder?.activation_id) {
+        return {
+            providerSignal: null,
+            providerValidationFailed: false,
+            decision: buildRefundDecision(normalizedOrder)
+        };
+    }
+    const providerSignal = analyzeProviderSmsResult(await checkSmsStatus(normalizedOrder.activation_id));
+    if (providerSignal.providerValidationFailed) {
+        return {
+            providerSignal,
+            providerValidationFailed: true,
+            decision: {
+                ...buildRefundDecision(normalizedOrder),
+                providerStatus: providerSignal.rawStatus || null,
+                refundAllowed: false,
+                reason: 'provider_final_verification_failed'
+            }
+        };
+    }
+    return {
+        providerSignal,
+        providerValidationFailed: false,
+        decision: buildRefundDecision(normalizedOrder, providerSignal)
+    };
+}
+
 async function syncOrderWithProviderSignal(order, providerSignal, options = {}) {
     if (!order || order.id == null || !providerSignal?.providerReportedNonPending) {
         return normalizeOrder(order);
@@ -2850,11 +2956,14 @@ async function expireOrderAndRefund(orderId) {
     try {
         await client.query('BEGIN');
         const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
-        const order = normalizeOrder(orderRes.rows[0]);
+        let order = normalizeOrder(orderRes.rows[0]);
         if (!order) {
             await client.query('ROLLBACK');
             return { found: false, expired: false, refunded: false, order: null };
         }
+        const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [order.user_id]);
+        const user = userRes.rows[0] || null;
+        const auditUsername = getAuditUsername(user, order);
         if (getRawOrderStatus(order) === 'expired') {
             await client.query('COMMIT');
             return {
@@ -2864,19 +2973,32 @@ async function expireOrderAndRefund(orderId) {
                 order: normalizeOrder(order),
                 message: getWebsiteRefundAmount(order) > 0
                     ? EXPIRED_REFUND_MESSAGE
-                    : 'Order expired, but refund is blocked until provider cost is cleared.'
+                    : 'Order expired, but refund is blocked until provider status verification completes.'
             };
         }
         const expiry = order.expires_at ? new Date(order.expires_at) : null;
         const now = new Date();
         const refundTime = now.toISOString();
-        if (isFinalOrderState(order) || normalizeOrderStatus(order) !== 'pending' || hasStoredOtp(order) || order.sms_received || !expiry || now < expiry) {
+        if (isRefundProcessing(order)) {
             await client.query('COMMIT');
-            if (order.sms_received || hasStoredOtp(order)) {
-                logOrderHotfixEvent('refund_blocked_existing_sms_or_otp', order, {
+            return {
+                found: true,
+                expired: false,
+                refunded: false,
+                order,
+                message: 'Refund is already being processed.'
+            };
+        }
+        if (isFinalOrderState(order) || normalizeOrderStatus(order) !== 'pending' || hasStoredOtp(order) || !expiry || now < expiry) {
+            await client.query('COMMIT');
+            if (hasStoredOtp(order)) {
+                logOrderHotfixEvent('refund_blocked_existing_otp', order, {
+                    username: auditUsername,
                     refundTime,
-                    providerStatus: order.provider_last_status,
-                    reason: 'existing_sms_or_otp'
+                    providerStatus: getProviderOrderStatus(order),
+                    reason: 'otp_exists_in_database',
+                    refunded: false,
+                    otpExisted: true
                 });
             }
             return {
@@ -2884,20 +3006,24 @@ async function expireOrderAndRefund(orderId) {
                 expired: false,
                 refunded: false,
                 order,
-                message: order.sms_received || hasStoredOtp(order)
-                    ? 'Refund temporarily locked after SMS/provider activity was detected.'
+                message: hasStoredOtp(order)
+                    ? 'OTP already received. Refund blocked.'
                     : 'Order is still active.'
             };
         }
         if (order.activation_id) {
-            const providerSignal = analyzeProviderSmsResult(await checkSmsStatus(order.activation_id));
-            if (providerSignal.providerValidationFailed) {
+            const initialVerification = await verifyRefundEligibilityWithProvider(order);
+            if (initialVerification.providerValidationFailed) {
                 await client.query('COMMIT');
                 logOrderHotfixEvent('refund_blocked_provider_validation', order, {
+                    username: auditUsername,
                     refundTime,
-                    providerStatus: providerSignal.rawStatus || null,
-                    providerError: providerSignal.providerError,
-                    reason: 'provider_validation_locked'
+                    providerStatus: initialVerification.decision.providerStatus || null,
+                    providerError: initialVerification.providerSignal?.providerError,
+                    reason: 'provider_final_verification_failed',
+                    refunded: false,
+                    otpExisted: initialVerification.decision.otpExists,
+                    providerSuccess: initialVerification.decision.providerSuccess
                 });
                 return {
                     found: true,
@@ -2907,32 +3033,38 @@ async function expireOrderAndRefund(orderId) {
                     message: 'Refund temporarily locked while activation status is being verified.'
                 };
             }
-            if (providerSignal.providerReportedNonPending) {
-                const updatedOrder = await syncOrderWithProviderSignal(order, providerSignal, {
-                    client,
-                    eventAt: refundTime,
-                    otpReceivedAt: refundTime
-                });
+            if (!initialVerification.decision.refundAllowed) {
+                const updatedOrder = initialVerification.providerSignal?.providerReportedNonPending
+                    ? await syncOrderWithProviderSignal(order, initialVerification.providerSignal, {
+                        client,
+                        eventAt: refundTime,
+                        otpReceivedAt: refundTime
+                    })
+                    : order;
                 await client.query('COMMIT');
-                logOrderHotfixEvent(providerSignal.hasCode ? 'refund_blocked_provider_otp' : 'refund_blocked_provider_sms', updatedOrder, {
+                logOrderHotfixEvent(initialVerification.decision.providerOtpExists ? 'refund_blocked_provider_otp' : 'refund_blocked_provider_success', updatedOrder, {
+                    username: auditUsername,
                     refundTime,
-                    otpArrivalTime: providerSignal.hasCode ? refundTime : null,
-                    providerStatus: providerSignal.rawStatus || null,
-                    reason: 'provider_non_pending'
+                    otpArrivalTime: initialVerification.decision.providerOtpExists ? refundTime : null,
+                    providerStatus: initialVerification.decision.providerStatus || null,
+                    reason: initialVerification.decision.reason,
+                    refunded: false,
+                    otpExisted: initialVerification.decision.otpExists,
+                    providerSuccess: initialVerification.decision.providerSuccess
                 });
                 return {
                     found: true,
                     expired: false,
                     refunded: false,
                     order: updatedOrder,
-                    message: providerSignal.hasCode
-                        ? 'OTP already received. Refund blocked.'
-                        : 'SMS/provider activity detected. Refund blocked.'
+                    message: getRefundBlockedMessage(initialVerification.decision)
                 };
             }
         }
-        const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [order.user_id]);
-        const user = userRes.rows[0] || null;
+        order = await setRefundProcessingState(order.id, refundTime, client) || normalizeOrder({
+            ...order,
+            refund_processing_at: refundTime
+        });
         const providerBalanceBaselineForExpire = await getProviderBalance();
         const expireCancelResult = await updateProviderActivationStatus(order.activation_id, 8);
         const providerBalanceAfterExpire = await getProviderBalance();
@@ -2947,16 +3079,49 @@ async function expireOrderAndRefund(orderId) {
         const previousProviderCostCurrency = roundMoney(order.real_provider_cost_provider_currency || 0, 6);
         const providerCostAlreadyClear = previousProviderCostCurrency <= PROVIDER_BALANCE_EPSILON
             && getRealProviderCostAmount(order) <= PROVIDER_BALANCE_EPSILON;
-        const providerRefundVerified = !order.activation_id
+        const providerCostVerified = !order.activation_id
             || providerCostAlreadyClear
             || (providerRecovery.balanceVerified && expireCancelResult.success);
         const remainingProviderCostCurrency = providerCostAlreadyClear
             ? 0
-            : (providerRefundVerified ? providerRecovery.remainingCurrency : previousProviderCostCurrency);
+            : (providerCostVerified ? providerRecovery.remainingCurrency : previousProviderCostCurrency);
         const remainingProviderCostPkr = providerCostAlreadyClear
             ? 0
-            : (providerRefundVerified ? providerRecovery.remainingPkr : getRealProviderCostAmount(order));
-        const refundAllowed = providerRefundVerified && remainingProviderCostCurrency <= PROVIDER_BALANCE_EPSILON;
+            : (providerCostVerified ? providerRecovery.remainingPkr : getRealProviderCostAmount(order));
+        const finalVerification = await verifyRefundEligibilityWithProvider(order);
+        if (!finalVerification.providerValidationFailed && !finalVerification.decision.refundAllowed) {
+            const blockedSyncedOrder = finalVerification.providerSignal?.providerReportedNonPending
+                ? await syncOrderWithProviderSignal(order, finalVerification.providerSignal, {
+                    client,
+                    eventAt: refundTime,
+                    otpReceivedAt: refundTime
+                })
+                : order;
+            const clearedBlockedOrder = await setRefundProcessingState(blockedSyncedOrder?.id || order.id, null, client);
+            const updatedOrder = clearedBlockedOrder || normalizeOrder({
+                ...(blockedSyncedOrder || order),
+                refund_processing_at: null
+            });
+            await client.query('COMMIT');
+            logOrderHotfixEvent(finalVerification.decision.providerOtpExists ? 'refund_blocked_provider_otp' : 'refund_blocked_provider_success', updatedOrder, {
+                username: auditUsername,
+                refundTime,
+                otpArrivalTime: finalVerification.decision.providerOtpExists ? refundTime : null,
+                providerStatus: finalVerification.decision.providerStatus || null,
+                reason: finalVerification.decision.reason,
+                refunded: false,
+                otpExisted: finalVerification.decision.otpExists,
+                providerSuccess: finalVerification.decision.providerSuccess
+            });
+            return {
+                found: true,
+                expired: false,
+                refunded: false,
+                order: updatedOrder,
+                message: getRefundBlockedMessage(finalVerification.decision)
+            };
+        }
+        const refundAllowed = finalVerification.decision.refundAllowed;
         const walletRefundAmount = refundAllowed && user ? Number(order.price || 0) : 0;
         if (walletRefundAmount > 0 && user) {
             await client.query('UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2', [
@@ -2968,36 +3133,38 @@ async function expireOrderAndRefund(orderId) {
         const expiredOrder = await updateOrder(order.id, {
             order_status: 'expired',
             status: 'expired',
-            provider_last_status: expireCancelResult.raw || order.provider_last_status || null
+            provider_last_status: finalVerification.decision.providerStatus || expireCancelResult.raw || order.provider_last_status || null,
+            refund_processing_at: null
         }, {
             client,
             eventAt: expiredAt,
             finalizedAt: expiredAt,
             syncNumberHistory: false
         });
+        const blockedReason = finalVerification.providerValidationFailed
+            ? 'provider_final_verification_failed'
+            : finalVerification.decision.reason;
         const updatedOrder = await syncOrderFinancialProtection(expiredOrder, {
             websiteCharge: Number(order.price || 0),
             websiteRefund: walletRefundAmount,
             websiteProfit: roundMoney(Number(order.price || 0) - walletRefundAmount),
             realProviderCost: remainingProviderCostPkr,
             realProviderCostProviderCurrency: remainingProviderCostCurrency,
-            providerCostVerified: providerRefundVerified || Boolean(order.provider_cost_verified),
-            providerCostSource: providerRefundVerified ? 'expire_balance_reconciliation' : order.provider_cost_source,
+            providerCostVerified: providerCostVerified || Boolean(order.provider_cost_verified),
+            providerCostSource: providerCostVerified ? 'expire_balance_reconciliation' : order.provider_cost_source,
             providerBalanceAfter: providerBalanceAfterExpire.success
                 ? providerBalanceAfterExpire.balance
                 : order.provider_balance_after,
             providerBalanceCurrency: providerBalanceAfterExpire.currency || order.provider_balance_currency || PROVIDER_BALANCE_CURRENCY,
-            providerStatus: expireCancelResult.raw || order.provider_status || order.provider_last_status || null,
-            providerFinalStatus: expireCancelResult.raw || order.provider_final_status || null,
+            providerStatus: finalVerification.decision.providerStatus || expireCancelResult.raw || order.provider_status || order.provider_last_status || null,
+            providerFinalStatus: finalVerification.decision.providerStatus || expireCancelResult.raw || order.provider_final_status || null,
             providerStatusSyncedAt: expiredAt,
             providerUsed: isProviderUsedOrder(order),
             refundedAt: walletRefundAmount > 0 ? expiredAt : null,
-            securityEventType: walletRefundAmount > 0 ? 'expire_refund_completed' : 'expire_refund_blocked_provider_cost',
+            securityEventType: walletRefundAmount > 0 ? 'expire_refund_completed' : 'expire_refund_blocked_provider_verification',
             reason: walletRefundAmount > 0
                 ? 'order_expired'
-                : (!expireCancelResult.success
-                    ? 'provider_expire_verification_failed'
-                    : 'provider_balance_cost_remaining'),
+                : blockedReason,
             recordRiskEvent: walletRefundAmount <= 0,
             syncNumberHistory: true,
             syncUserRisk: walletRefundAmount <= 0,
@@ -3023,12 +3190,16 @@ async function expireOrderAndRefund(orderId) {
             });
         }
         await client.query('COMMIT');
-        logOrderHotfixEvent(walletRefundAmount > 0 ? 'refund_completed_expired_order' : 'refund_blocked_expired_provider_cost', updatedOrder, {
+        logOrderHotfixEvent(walletRefundAmount > 0 ? 'refund_completed_expired_order' : 'refund_blocked_expired_provider_verification', updatedOrder, {
+            username: auditUsername,
             refundTime: expiredAt,
-            providerStatus: expireCancelResult.raw || null,
+            providerStatus: finalVerification.decision.providerStatus || expireCancelResult.raw || null,
             reason: walletRefundAmount > 0
                 ? 'order_expired'
-                : (!expireCancelResult.success ? 'provider_expire_verification_failed' : 'provider_balance_cost_remaining')
+                : blockedReason,
+            refunded: walletRefundAmount > 0,
+            otpExisted: finalVerification.decision.otpExists,
+            providerSuccess: finalVerification.decision.providerSuccess
         });
         return {
             found: true,
@@ -3037,9 +3208,7 @@ async function expireOrderAndRefund(orderId) {
             order: updatedOrder,
             message: walletRefundAmount > 0
                 ? EXPIRED_REFUND_MESSAGE
-                : (!expireCancelResult.success
-                    ? 'Order expired, but refund is blocked because provider cancellation could not be verified.'
-                    : 'Order expired, but refund is blocked because provider cost is still charged.')
+                : 'Order expired, but refund is blocked until provider status verification completes.'
         };
     } catch (err) {
         await client.query('ROLLBACK');
@@ -9973,7 +10142,7 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
         const orderId = Number(req.params.orderId);
         await client.query('BEGIN');
         const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
-        const order = normalizeOrder(orderRes.rows[0]);
+        let order = normalizeOrder(orderRes.rows[0]);
         if (!order) {
             await client.query('ROLLBACK');
             return res.status(404).send('Order not found');
@@ -9984,52 +10153,70 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(403).send('Unauthorized');
         }
+        const auditUsername = getAuditUsername(user, order);
         await enforceCancelSecurityLimits(user.id, order, { client });
+        if (isRefundProcessing(order)) {
+            await client.query('ROLLBACK');
+            return res.status(409).send('Refund is already being processed.');
+        }
         if (isFinalOrderState(order) || normalizeOrderStatus(order) !== 'pending') {
             await client.query('ROLLBACK');
             return res.status(400).send('Cannot cancel now');
         }
-        if (order.sms_received || hasStoredOtp(order)) {
+        if (hasStoredOtp(order)) {
             await client.query('ROLLBACK');
-            logOrderHotfixEvent('cancel_rejected_existing_sms_or_otp', order, {
+            logOrderHotfixEvent('cancel_rejected_existing_otp', order, {
+                username: auditUsername,
                 cancelTime: new Date().toISOString(),
-                providerStatus: order.provider_last_status,
-                reason: 'existing_sms_or_otp'
+                providerStatus: getProviderOrderStatus(order),
+                reason: 'otp_exists_in_database',
+                refunded: false,
+                otpExisted: true
             });
-            return res.status(400).send(order.sms_received && !hasStoredOtp(order) ? 'SMS already received, cannot cancel' : 'OTP already received, cannot cancel');
+            return res.status(400).send('OTP already received, cannot cancel');
         }
         const now = new Date();
         const expiry = order.expires_at ? new Date(order.expires_at) : null;
         const cancelTime = now.toISOString();
         if (order.activation_id) {
-            const providerSignal = analyzeProviderSmsResult(await checkSmsStatus(order.activation_id));
-            if (providerSignal.providerValidationFailed) {
+            const initialVerification = await verifyRefundEligibilityWithProvider(order);
+            if (initialVerification.providerValidationFailed) {
                 await client.query('ROLLBACK');
                 logOrderHotfixEvent('cancel_blocked_provider_validation', order, {
+                    username: auditUsername,
                     cancelTime,
-                    providerStatus: providerSignal.rawStatus || null,
-                    providerError: providerSignal.providerError,
-                    reason: 'provider_validation_locked'
+                    providerStatus: initialVerification.decision.providerStatus || null,
+                    providerError: initialVerification.providerSignal?.providerError,
+                    reason: 'provider_final_verification_failed',
+                    refunded: false,
+                    otpExisted: initialVerification.decision.otpExists,
+                    providerSuccess: initialVerification.decision.providerSuccess
                 });
                 return res.status(409).send('Cancel temporarily locked while activation status is being verified.');
             }
-            if (providerSignal.providerReportedNonPending) {
-                const updatedOrder = await syncOrderWithProviderSignal(order, providerSignal, {
-                    client,
-                    eventAt: cancelTime,
-                    otpReceivedAt: cancelTime
-                });
+            if (!initialVerification.decision.refundAllowed) {
+                const updatedOrder = initialVerification.providerSignal?.providerReportedNonPending
+                    ? await syncOrderWithProviderSignal(order, initialVerification.providerSignal, {
+                        client,
+                        eventAt: cancelTime,
+                        otpReceivedAt: cancelTime
+                    })
+                    : order;
                 await client.query('COMMIT');
-                logOrderHotfixEvent(providerSignal.hasCode ? 'cancel_rejected_provider_otp' : 'cancel_rejected_provider_sms', updatedOrder, {
+                logOrderHotfixEvent(initialVerification.decision.providerOtpExists ? 'cancel_rejected_provider_otp' : 'cancel_rejected_provider_success', updatedOrder, {
+                    username: auditUsername,
                     cancelTime,
-                    otpArrivalTime: providerSignal.hasCode ? cancelTime : null,
-                    providerStatus: providerSignal.rawStatus || null,
-                    reason: 'provider_non_pending'
+                    otpArrivalTime: initialVerification.decision.providerOtpExists ? cancelTime : null,
+                    providerStatus: initialVerification.decision.providerStatus || null,
+                    reason: initialVerification.decision.reason,
+                    refunded: false,
+                    otpExisted: initialVerification.decision.otpExists,
+                    providerSuccess: initialVerification.decision.providerSuccess
                 });
-                return res.status(400).send(providerSignal.hasCode ? 'OTP already received, cannot cancel' : 'SMS already received, cannot cancel');
+                return res.status(400).send(getRefundBlockedMessage(initialVerification.decision, 'cancel'));
             }
         }
-        if (expiry && now >= expiry && !order.sms_received && !hasStoredOtp(order) && getRawOrderStatus(order) === 'pending') {
+        if (expiry && now >= expiry && !hasStoredOtp(order) && getRawOrderStatus(order) === 'pending') {
             await client.query('ROLLBACK');
             const expireResult = await expireOrderAndRefund(order.id);
             return res.status(expireResult.expired ? 200 : 409).send(expireResult.message || EXPIRED_REFUND_MESSAGE);
@@ -10039,6 +10226,10 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).send(`Please wait ${Math.ceil((cancelAvailable - now) / 1000)} seconds before cancelling.`);
         }
+        order = await setRefundProcessingState(order.id, cancelTime, client) || normalizeOrder({
+            ...order,
+            refund_processing_at: cancelTime
+        });
         const providerBalanceBaselineForCancel = await getProviderBalance();
         const cancelResult = await updateProviderActivationStatus(order.activation_id, 8);
         const providerBalanceAfterCancel = await getProviderBalance();
@@ -10053,16 +10244,43 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
         const previousProviderCostCurrency = roundMoney(order.real_provider_cost_provider_currency || 0, 6);
         const providerCostAlreadyClear = previousProviderCostCurrency <= PROVIDER_BALANCE_EPSILON
             && getRealProviderCostAmount(order) <= PROVIDER_BALANCE_EPSILON;
-        const providerRefundVerified = !order.activation_id
+        const providerCostVerified = !order.activation_id
             || providerCostAlreadyClear
             || (providerRecovery.balanceVerified && cancelResult.success);
         const remainingProviderCostCurrency = providerCostAlreadyClear
             ? 0
-            : (providerRefundVerified ? providerRecovery.remainingCurrency : previousProviderCostCurrency);
+            : (providerCostVerified ? providerRecovery.remainingCurrency : previousProviderCostCurrency);
         const remainingProviderCostPkr = providerCostAlreadyClear
             ? 0
-            : (providerRefundVerified ? providerRecovery.remainingPkr : getRealProviderCostAmount(order));
-        const refundAllowed = providerRefundVerified && remainingProviderCostCurrency <= PROVIDER_BALANCE_EPSILON;
+            : (providerCostVerified ? providerRecovery.remainingPkr : getRealProviderCostAmount(order));
+        const finalVerification = await verifyRefundEligibilityWithProvider(order);
+        if (!finalVerification.providerValidationFailed && !finalVerification.decision.refundAllowed) {
+            const blockedSyncedOrder = finalVerification.providerSignal?.providerReportedNonPending
+                ? await syncOrderWithProviderSignal(order, finalVerification.providerSignal, {
+                    client,
+                    eventAt: cancelTime,
+                    otpReceivedAt: cancelTime
+                })
+                : order;
+            const clearedBlockedOrder = await setRefundProcessingState(blockedSyncedOrder?.id || order.id, null, client);
+            const updatedOrder = clearedBlockedOrder || normalizeOrder({
+                ...(blockedSyncedOrder || order),
+                refund_processing_at: null
+            });
+            await client.query('COMMIT');
+            logOrderHotfixEvent(finalVerification.decision.providerOtpExists ? 'cancel_rejected_provider_otp' : 'cancel_rejected_provider_success', updatedOrder, {
+                username: auditUsername,
+                cancelTime,
+                otpArrivalTime: finalVerification.decision.providerOtpExists ? cancelTime : null,
+                providerStatus: finalVerification.decision.providerStatus || null,
+                reason: finalVerification.decision.reason,
+                refunded: false,
+                otpExisted: finalVerification.decision.otpExists,
+                providerSuccess: finalVerification.decision.providerSuccess
+            });
+            return res.status(400).send(getRefundBlockedMessage(finalVerification.decision, 'cancel'));
+        }
+        const refundAllowed = finalVerification.decision.refundAllowed;
         const walletRefundAmount = refundAllowed ? Number(order.price || 0) : 0;
         if (walletRefundAmount > 0) {
             await client.query('UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2', [
@@ -10074,36 +10292,38 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
         const cancelledOrder = await updateOrder(order.id, {
             order_status: 'cancelled',
             status: 'cancelled',
-            provider_last_status: cancelResult.raw || order.provider_last_status || null
+            provider_last_status: finalVerification.decision.providerStatus || cancelResult.raw || order.provider_last_status || null,
+            refund_processing_at: null
         }, {
             client,
             eventAt: cancelledAt,
             finalizedAt: cancelledAt,
             syncNumberHistory: false
         });
+        const blockedReason = finalVerification.providerValidationFailed
+            ? 'provider_final_verification_failed'
+            : finalVerification.decision.reason;
         const updatedOrder = await syncOrderFinancialProtection(cancelledOrder, {
             websiteCharge: Number(order.price || 0),
             websiteRefund: walletRefundAmount,
             websiteProfit: roundMoney(Number(order.price || 0) - walletRefundAmount),
             realProviderCost: remainingProviderCostPkr,
             realProviderCostProviderCurrency: remainingProviderCostCurrency,
-            providerCostVerified: providerRefundVerified || Boolean(order.provider_cost_verified),
-            providerCostSource: providerRefundVerified ? 'cancel_balance_reconciliation' : order.provider_cost_source,
+            providerCostVerified: providerCostVerified || Boolean(order.provider_cost_verified),
+            providerCostSource: providerCostVerified ? 'cancel_balance_reconciliation' : order.provider_cost_source,
             providerBalanceAfter: providerBalanceAfterCancel.success
                 ? providerBalanceAfterCancel.balance
                 : order.provider_balance_after,
             providerBalanceCurrency: providerBalanceAfterCancel.currency || order.provider_balance_currency || PROVIDER_BALANCE_CURRENCY,
-            providerStatus: cancelResult.raw || order.provider_status || order.provider_last_status || null,
-            providerFinalStatus: cancelResult.raw || order.provider_final_status || null,
+            providerStatus: finalVerification.decision.providerStatus || cancelResult.raw || order.provider_status || order.provider_last_status || null,
+            providerFinalStatus: finalVerification.decision.providerStatus || cancelResult.raw || order.provider_final_status || null,
             providerStatusSyncedAt: cancelledAt,
             providerUsed: isProviderUsedOrder(order),
             refundedAt: walletRefundAmount > 0 ? cancelledAt : null,
-            securityEventType: walletRefundAmount > 0 ? 'cancel_refund_completed' : 'cancel_refund_blocked_provider_cost',
+            securityEventType: walletRefundAmount > 0 ? 'cancel_refund_completed' : 'cancel_refund_blocked_provider_verification',
             reason: walletRefundAmount > 0
                 ? 'user_cancelled'
-                : (!cancelResult.success
-                    ? 'provider_cancel_verification_failed'
-                    : 'provider_balance_cost_remaining'),
+                : blockedReason,
             recordRiskEvent: walletRefundAmount <= 0,
             syncNumberHistory: true,
             syncUserRisk: walletRefundAmount <= 0,
@@ -10129,19 +10349,21 @@ app.post('/api/orders/:orderId/cancel', ensureAuth, async (req, res) => {
             });
         }
         await client.query('COMMIT');
-        logOrderHotfixEvent(walletRefundAmount > 0 ? 'cancel_refund_completed' : 'cancel_refund_blocked_provider_cost', updatedOrder, {
+        logOrderHotfixEvent(walletRefundAmount > 0 ? 'cancel_refund_completed' : 'cancel_refund_blocked_provider_verification', updatedOrder, {
+            username: auditUsername,
             cancelTime: cancelledAt,
             refundTime: walletRefundAmount > 0 ? cancelledAt : null,
-            providerStatus: cancelResult.raw || null,
+            providerStatus: finalVerification.decision.providerStatus || cancelResult.raw || null,
             reason: walletRefundAmount > 0
                 ? 'user_cancelled'
-                : (!cancelResult.success ? 'provider_cancel_verification_failed' : 'provider_balance_cost_remaining')
+                : blockedReason,
+            refunded: walletRefundAmount > 0,
+            otpExisted: finalVerification.decision.otpExists,
+            providerSuccess: finalVerification.decision.providerSuccess
         });
         res.status(walletRefundAmount > 0 ? 200 : 409).send(walletRefundAmount > 0
             ? 'Order cancelled & refunded'
-            : (!cancelResult.success
-                ? 'Order cancelled, but refund was blocked because provider cancellation could not be verified.'
-                : 'Order cancelled, but refund was blocked because provider cost is still charged.'));
+            : 'Order cancelled, but refund is blocked until provider status verification completes.');
     } catch (err) {
         await client.query('ROLLBACK');
         res.status(500).send(formatSafeError(err, 'Cancel failed'));
@@ -10221,7 +10443,7 @@ app.get('/api/orders/:orderId/otp', ensureAuth, async (req, res) => {
                 inactive: true,
                 message: getWebsiteRefundAmount(order) > 0
                     ? EXPIRED_REFUND_MESSAGE
-                    : 'Order expired, but refund is blocked until provider cost is cleared.',
+                    : 'Order expired, but refund is blocked until provider status verification completes.',
                 status: order.status || order.order_status
             });
         }
