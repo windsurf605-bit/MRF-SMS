@@ -55,7 +55,7 @@ const state = {
 };
 
 const ORDER_PROVIDER_WAITING_STATUS = 'STATUS_WAIT_CODE';
-const ADMIN_LIVE_REFRESH_INTERVAL_MS = 9000;
+const ADMIN_LIVE_REFRESH_INTERVAL_MS = 10000;
 
 const adminAccordion = {
     panel: null,
@@ -1959,6 +1959,14 @@ function isWaitingViewOrder(order) {
     return lifecycle === 'pending' || lifecycle === 'active';
 }
 
+function isValidActiveDashboardOrder(order) {
+    return Boolean(order)
+        && !isCancelledOrderHidden(order)
+        && !isFinalOrderLifecycle(order)
+        && !isAutoExpirableDashboardOrder(order)
+        && isWaitingViewOrder(order);
+}
+
 function isPaidOrder(order) {
     return getOrderLifecycleStatus(order) === 'completed';
 }
@@ -2095,6 +2103,14 @@ async function refreshAdminProviderSummarySection(options = {}) {
     try {
         const providerAnalytics = await fetchJSON('/api/admin/provider-analytics');
         renderAdminProviderSummary(providerAnalytics?.summary || {});
+        renderAdminStats(providerAnalytics?.financeSummary || {});
+        renderAdminDailyProfitDetails(providerAnalytics?.dailyEarnings || [], providerAnalytics?.financeSummary || {});
+        renderAdminProviderServiceBreakdown(providerAnalytics?.serviceBreakdown || []);
+        renderAdminProviderBalanceSnapshots(providerAnalytics?.recentBalanceSnapshots || []);
+        renderAdminProviderSecurityEvents(providerAnalytics?.recentSecurityEvents || []);
+        renderAdminProviderRiskUsers(providerAnalytics?.topRiskUsers || []);
+        renderAdminProviderDailyEarnings(providerAnalytics?.dailyEarnings || [], providerAnalytics?.financeSummary || {});
+        renderAdminBlockedUsers(providerAnalytics?.blockedUsers || []);
     } catch (err) {
         if (!options.silent) {
             showToast(err.message || 'Failed to refresh provider summary', 'error');
@@ -2257,7 +2273,7 @@ function sortOrdersByMostRecent(orders) {
 }
 
 function getActiveOrdersFromState() {
-    return sortOrdersByMostRecent((state.orders || []).filter((order) => ['pending', 'active'].includes(getOrderLifecycleStatus(order))));
+    return sortOrdersByMostRecent((state.orders || []).filter((order) => isValidActiveDashboardOrder(order)));
 }
 
 function getCompletedOrdersFromState() {
@@ -2766,7 +2782,11 @@ function upsertOrderInState(order) {
         state.completedOrders = sortOrdersByMostRecent([order, ...state.completedOrders]);
         return;
     }
-    if (['pending', 'active'].includes(lifecycleStatus)) {
+    if (isAutoExpirableDashboardOrder(order)) {
+        void queueDashboardOrderExpiry(order);
+        return;
+    }
+    if (isValidActiveDashboardOrder(order)) {
         state.orders = sortOrdersByMostRecent([order, ...state.orders]);
     }
 }
@@ -2806,9 +2826,15 @@ function mergeOrdersWithLocalState(fetchedOrders) {
             void queueDashboardOrderExpiry(order);
             return false;
         }
-        return ['pending', 'active'].includes(getOrderLifecycleStatus(order));
+        return isValidActiveDashboardOrder(order);
     });
-    return sortOrdersByMostRecent([...localPendingOrders, ...normalizedFetchedOrders].filter((order) => ['pending', 'active'].includes(getOrderLifecycleStatus(order))));
+    return sortOrdersByMostRecent([...localPendingOrders, ...normalizedFetchedOrders].filter((order) => {
+        if (isAutoExpirableDashboardOrder(order)) {
+            void queueDashboardOrderExpiry(order);
+            return false;
+        }
+        return isValidActiveDashboardOrder(order);
+    }));
 }
 
 function ensureOrderCardVisible(orderData) {
@@ -3132,7 +3158,13 @@ function renderCompletedOrders() {
 function renderActiveOrders(orders) {
     const container = qs('active-orders-list');
     if (!container) return;
-    state.orders = sortOrdersByMostRecent(filterHiddenCancelledOrders(orders).filter((order) => ['pending', 'active'].includes(getOrderLifecycleStatus(order))));
+    state.orders = sortOrdersByMostRecent(filterHiddenCancelledOrders(orders).filter((order) => {
+        if (isAutoExpirableDashboardOrder(order)) {
+            void queueDashboardOrderExpiry(order);
+            return false;
+        }
+        return isValidActiveDashboardOrder(order);
+    }));
     syncInlineOrderPolling();
     syncInlineOrderTimers();
     updateActivationSummaryLine();
@@ -3343,10 +3375,18 @@ function renderAdminDailyProfitDetails(entries, summary) {
     if (!container) return;
     const todayKey = getFinancialDateKey(new Date());
     const summaryMarkup = `
-        <div class="grid gap-3 sm:grid-cols-2">
+        <div class="grid gap-3 lg:grid-cols-4">
             <div class="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                 <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-700">Today Profit</div>
                 <div class="mt-2 text-2xl font-extrabold text-emerald-700">${escapeHtml(formatMoneyPrecise(summary?.todayProfit || 0))}</div>
+            </div>
+            <div class="rounded-2xl border border-cyan-200 bg-cyan-50 p-4">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-700">Today Revenue</div>
+                <div class="mt-2 text-2xl font-extrabold text-cyan-700">${escapeHtml(formatMoneyPrecise(summary?.todayRevenue || 0))}</div>
+            </div>
+            <div class="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-700">Today API Cost</div>
+                <div class="mt-2 text-2xl font-extrabold text-amber-700">${escapeHtml(formatMoneyPrecise(summary?.todayApiCost || 0))}</div>
             </div>
             <div class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
                 <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Overall Profit</div>
@@ -3355,7 +3395,7 @@ function renderAdminDailyProfitDetails(entries, summary) {
         </div>
     `;
     if (!entries.length) {
-        container.innerHTML = `${summaryMarkup}<div class="mt-4">${renderEmptyState('No profit data available', 'Completed orders will populate the date-wise profit table automatically.')}</div>`;
+        container.innerHTML = `${summaryMarkup}<div class="mt-4">${renderEmptyState('No daily earnings data available', 'Backend-verified revenue, provider cost, and profit totals will appear automatically.')}</div>`;
         return;
     }
     const rows = entries.map((entry) => {
@@ -3368,11 +3408,16 @@ function renderAdminDailyProfitDetails(entries, summary) {
                         ${isTodayRow ? '<span class="inline-flex rounded-full bg-emerald-100 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-700">Today</span>' : ''}
                     </div>
                 </td>
-                <td class="px-4 py-3 whitespace-nowrap font-semibold text-emerald-700">${escapeHtml(formatMoneyPrecise(entry.profit))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-cyan-700">${escapeHtml(formatMoneyPrecise(entry.revenue || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-amber-700">${escapeHtml(formatMoneyPrecise(entry.apiCost || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold ${(Number(entry.profitLoss || 0) >= 0) ? 'text-emerald-700' : 'text-rose-700'}">${escapeHtml(formatMoneyPrecise(entry.profitLoss || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(entry.refunds || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.completedOrders || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.cancelledOrders || 0))}</td>
             </tr>
         `;
     }).join('');
-    container.innerHTML = `${summaryMarkup}<div class="mt-4">${renderAdminTable(['Date', 'Profit'], rows, 'min-w-[560px]')}</div>`;
+    container.innerHTML = `${summaryMarkup}<div class="mt-4">${renderAdminTable(['Date', 'Revenue', 'API Cost', 'Profit', 'Refunds', 'Completed', 'Cancelled'], rows, 'min-w-[1080px]')}</div>`;
 }
 
 function renderAdminUserSpending(spending, users) {
@@ -3591,14 +3636,66 @@ function renderAdminProviderRiskUsers(users) {
             <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(user.email || '—')}</td>
             <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(String(Number(user.security_risk_score || 0)))}</td>
             <td class="px-4 py-3">${renderStatusBadge(user.security_risk_status || 'safe')}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(Number(user.confirmed_provider_loss_count || 0)))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold ${Number(user.total_provider_loss || 0) > 0 ? 'text-rose-700' : 'text-slate-700'}">${escapeHtml(formatMoneyPrecise(user.total_provider_loss || 0))}</td>
             <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(user.security_blocked_until ? formatRelativeTime(user.security_blocked_until) : '—')}</td>
         </tr>
     `).join('');
     container.innerHTML = renderAdminTable(
-        ['User ID', 'Name', 'Email', 'Risk Score', 'Risk Status', 'Blocked Until'],
+        ['User ID', 'Name', 'Email', 'Risk Score', 'Risk Status', 'Confirmed Losses', 'Provider Loss', 'Blocked Until'],
         rows,
-        'min-w-[980px]'
+        'min-w-[1180px]'
     );
+}
+
+function renderAdminProviderDailyEarnings(entries, summary) {
+    const container = qs('admin-provider-daily-earnings');
+    if (!container) return;
+    const todayKey = getFinancialDateKey(new Date());
+    const headerMarkup = `
+        <div class="grid gap-3 lg:grid-cols-4">
+            <div class="rounded-2xl border border-cyan-200 bg-cyan-50 p-4">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-700">Today Revenue</div>
+                <div class="mt-2 text-2xl font-extrabold text-cyan-700">${escapeHtml(formatMoneyPrecise(summary?.todayRevenue || 0))}</div>
+            </div>
+            <div class="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-700">Today API Cost</div>
+                <div class="mt-2 text-2xl font-extrabold text-amber-700">${escapeHtml(formatMoneyPrecise(summary?.todayApiCost || 0))}</div>
+            </div>
+            <div class="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-700">Today Profit</div>
+                <div class="mt-2 text-2xl font-extrabold text-emerald-700">${escapeHtml(formatMoneyPrecise(summary?.todayProfit || 0))}</div>
+            </div>
+            <div class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Today Refunds</div>
+                <div class="mt-2 text-2xl font-extrabold text-slate-900">${escapeHtml(formatMoneyPrecise(summary?.todayRefunds || 0))}</div>
+            </div>
+        </div>
+    `;
+    if (!entries.length) {
+        container.innerHTML = `${headerMarkup}<div class="mt-4">${renderEmptyState('No daily earnings rows yet', 'This table will refresh automatically from backend-verified provider deductions and completed-order revenue.')}</div>`;
+        return;
+    }
+    const rows = entries.map((entry) => {
+        const isTodayRow = entry.date === todayKey;
+        return `
+            <tr class="border-b border-slate-200 align-top last:border-b-0 ${isTodayRow ? 'bg-cyan-50/60' : ''}">
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">
+                    <div class="inline-flex items-center gap-2">
+                        <span>${escapeHtml(entry.date || '—')}</span>
+                        ${isTodayRow ? '<span class="inline-flex rounded-full bg-cyan-100 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-cyan-700">Today</span>' : ''}
+                    </div>
+                </td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-cyan-700">${escapeHtml(formatMoneyPrecise(entry.revenue || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-amber-700">${escapeHtml(formatMoneyPrecise(entry.apiCost || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold ${(Number(entry.profitLoss || 0) >= 0) ? 'text-emerald-700' : 'text-rose-700'}">${escapeHtml(formatMoneyPrecise(entry.profitLoss || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(entry.refunds || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.completedOrders || 0))}</td>
+                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.cancelledOrders || 0))}</td>
+            </tr>
+        `;
+    }).join('');
+    container.innerHTML = `${headerMarkup}<div class="mt-4">${renderAdminTable(['Date', 'Revenue', 'API Cost', 'Profit', 'Refunds', 'Completed', 'Cancelled'], rows, 'min-w-[1080px]')}</div>`;
 }
 
 function renderAdminStats(stats) {
@@ -3624,6 +3721,47 @@ function renderAdminStats(stats) {
         ['Scope', 'Deposits', 'Income', 'API Cost', 'Real Profit'],
         rows,
         'min-w-[980px]'
+    );
+}
+
+function renderAdminBlockedUsers(users) {
+    const container = qs('admin-blocked-users-list');
+    if (!container) return;
+    if (!users.length) {
+        container.innerHTML = renderEmptyState('No blocked users', 'Users auto-blocked or manually blocked for confirmed provider loss will appear here.');
+        return;
+    }
+    const rows = users.map((user) => `
+        <tr class="border-b border-slate-200 align-top last:border-b-0 bg-rose-50/40">
+            <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(user.name || 'Unknown user')}</td>
+            <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(user.email || '—')}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-700">${escapeHtml(String(Number(user.confirmed_provider_loss_count || 0)))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-rose-700">${escapeHtml(formatMoneyPrecise(user.total_provider_loss || 0))}</td>
+            <td class="px-4 py-3 text-slate-600">${escapeHtml(user.security_block_reason || user.latest_security_reason || 'Confirmed provider loss threshold reached')}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(user.security_blocked_until ? formatRelativeTime(user.security_blocked_until) : '—')}</td>
+            <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(user.latest_security_order_id == null ? '—' : `#${user.latest_security_order_id}`)}</td>
+            <td class="px-4 py-3">
+                <div class="flex flex-wrap gap-2">
+                    <button class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50" data-action="view-user-history" data-user-id="${escapeAttr(user.id)}" data-user-label="${escapeAttr(user.name || user.email || `User #${user.id}`)}">
+                        <i class="fa-solid fa-clock-rotate-left"></i>
+                        <span>History</span>
+                    </button>
+                    <button class="inline-flex items-center gap-1 rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-1.5 text-xs font-semibold text-cyan-700 transition hover:bg-cyan-100" data-action="admin-user-unblock" data-user-id="${escapeAttr(user.id)}" data-user-label="${escapeAttr(user.name || user.email || `User #${user.id}`)}">
+                        <i class="fa-solid fa-unlock"></i>
+                        <span>Unblock</span>
+                    </button>
+                    <button class="inline-flex items-center gap-1 rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-700 transition hover:bg-amber-100" data-action="admin-user-remove-risk" data-user-id="${escapeAttr(user.id)}" data-user-label="${escapeAttr(user.name || user.email || `User #${user.id}`)}">
+                        <i class="fa-solid fa-shield-heart"></i>
+                        <span>Remove Risk</span>
+                    </button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+    container.innerHTML = renderAdminTable(
+        ['Name', 'Email', 'Confirmed Losses', 'Provider Loss', 'Block Reason', 'Blocked Until', 'Latest Order', 'Actions'],
+        rows,
+        'min-w-[1480px]'
     );
 }
 
@@ -4007,13 +4145,24 @@ function renderAdminUserHistory(history, userLabel) {
         return renderEmptyState('No history records', `${userLabel || 'This user'} has no purchases, deposits, or manual adjustments yet.`);
     }
     const rows = history.map((entry) => {
-        const isNegative = Number(entry.amount || 0) < 0;
-        const amountText = `${isNegative ? '-' : '+'}${formatMoneyPrecise(Math.abs(Number(entry.amount || 0)))}`;
+        const normalizedAmount = entry.entry_type === 'order'
+            ? -Math.abs(Number(entry.amount || 0))
+            : Number(entry.amount || 0);
+        const isNegative = normalizedAmount < 0;
+        const amountText = `${isNegative ? '-' : '+'}${formatMoneyPrecise(Math.abs(normalizedAmount))}`;
+        const detailsMarkup = entry.entry_type === 'order'
+            ? `
+                <div class="font-medium text-slate-700">${escapeHtml(entry.details || '—')}</div>
+                <div class="mt-1 text-xs text-slate-500">Number: ${escapeHtml(entry.phone_number || '—')} • Service: ${escapeHtml(formatStatus(entry.service_type || 'unknown'))} • Country: ${escapeHtml(entry.country || '—')}</div>
+                <div class="mt-1 text-xs text-slate-500">Provider: ${escapeHtml(entry.provider_status || '—')} • OTP: ${escapeHtml(entry.otp_received ? 'Received' : 'No')}</div>
+                <div class="mt-1 text-xs text-slate-500">Refund: ${escapeHtml(formatMoneyPrecise(entry.refund_amount || 0))} • Provider deduction: ${escapeHtml(formatMoneyPrecise(entry.provider_deduction_amount || 0))} • Provider loss: ${escapeHtml(formatMoneyPrecise(entry.provider_loss_amount || 0))}</div>
+            `
+            : `<div class="text-slate-600">${escapeHtml(entry.details || '—')}</div>`;
         return `
             <tr class="border-b border-slate-200 align-top last:border-b-0">
                 <td class="px-4 py-3">${renderStatusBadge(entry.entry_type || 'entry')}</td>
                 <td class="px-4 py-3 whitespace-nowrap font-semibold ${isNegative ? 'text-rose-700' : 'text-emerald-700'}">${escapeHtml(amountText)}</td>
-                <td class="px-4 py-3 text-slate-600">${escapeHtml(entry.details || '—')}</td>
+                <td class="px-4 py-3">${detailsMarkup}</td>
                 <td class="px-4 py-3">${renderStatusBadge(entry.status || 'approved')}</td>
                 <td class="px-4 py-3 whitespace-nowrap text-slate-500">${escapeHtml(formatRelativeTime(entry.created_at))}</td>
             </tr>
@@ -4152,35 +4301,17 @@ async function loadAdminData() {
         const pendingPaymentRequests = paymentRequests.filter((request) => String(request.status || '').toLowerCase() === 'pending');
         const processedPaymentRequests = paymentRequests.filter((request) => String(request.status || '').toLowerCase() !== 'pending');
         const totalPendingCount = pendingPaymentRequests.length + pendingTransactions.length;
-        const approvedDeposits = ledgerTransactions.filter((transaction) => {
-            return String(transaction.status || '').toLowerCase() === 'approved'
-                && String(transaction.type || 'deposit').toLowerCase() === 'deposit';
-        });
-        const totalDeposits = approvedDeposits.reduce((sum, transaction) => sum + Number(transaction.amount || 0), 0);
-        const todayDeposits = approvedDeposits
-            .filter((transaction) => isTodayDate(transaction.created_at))
-            .reduce((sum, transaction) => sum + Number(transaction.amount || 0), 0);
-        const successfulOrders = orders.filter((order) => {
-            const lifecycleStatus = getOrderLifecycleStatus(order);
-            if (['cancelled', 'expired', 'pending'].includes(lifecycleStatus)) return false;
-            return lifecycleStatus === 'completed' || Boolean(order?.otp_received || String(order?.otp_code || '').trim());
-        });
-        const todaySuccessfulOrders = successfulOrders.filter((order) => isTodayDate(getOrderFinancialTimestamp(order)));
-        const totalIncome = successfulOrders.reduce((sum, order) => sum + Number(order.price || 0), 0);
-        const todayIncome = todaySuccessfulOrders.reduce((sum, order) => sum + Number(order.price || 0), 0);
-        const totalApiCost = successfulOrders.reduce((sum, order) => sum + getOrderApiCost(order), 0);
-        const todayApiCost = todaySuccessfulOrders.reduce((sum, order) => sum + getOrderApiCost(order), 0);
-        const totalProfit = successfulOrders.reduce((sum, order) => sum + getOrderProfit(order), 0);
-        const todayProfit = todaySuccessfulOrders.reduce((sum, order) => sum + getOrderProfit(order), 0);
-        renderAdminStats({ totalDeposits, todayDeposits, totalIncome, todayIncome, totalApiCost, todayApiCost, totalProfit, todayProfit });
+        renderAdminStats(providerAnalytics?.financeSummary || {});
         renderAdminTotalUsersSummary(users);
-        renderAdminDailyProfitDetails(calculateDailyProfitDetails(orders), { todayProfit, totalProfit });
+        renderAdminDailyProfitDetails(providerAnalytics?.dailyEarnings || [], providerAnalytics?.financeSummary || {});
         renderAdminUserSpending(calculateUserSpending(orders), users);
         renderAdminProviderSummary(providerAnalytics?.summary || {});
         renderAdminProviderServiceBreakdown(providerAnalytics?.serviceBreakdown || []);
         renderAdminProviderBalanceSnapshots(providerAnalytics?.recentBalanceSnapshots || []);
         renderAdminProviderSecurityEvents(providerAnalytics?.recentSecurityEvents || []);
         renderAdminProviderRiskUsers(providerAnalytics?.topRiskUsers || []);
+        renderAdminProviderDailyEarnings(providerAnalytics?.dailyEarnings || [], providerAnalytics?.financeSummary || {});
+        renderAdminBlockedUsers(providerAnalytics?.blockedUsers || []);
         const latestSecurityEvent = providerAnalytics?.recentSecurityEvents?.[0] || null;
         if (latestSecurityEvent?.id != null) {
             const latestSecurityEventId = Number(latestSecurityEvent.id || 0);
