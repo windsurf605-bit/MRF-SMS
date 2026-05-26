@@ -304,7 +304,12 @@ function normalizeUser(row) {
         security_risk_score: Number(row.security_risk_score || 0),
         security_risk_status: String(row.security_risk_status || 'safe').trim().toLowerCase() || 'safe',
         security_blocked_until: row.security_blocked_until || null,
-        latest_provider_loss_amount: Number(row.latest_provider_loss_amount || 0)
+        security_block_reason: String(row.security_block_reason || '').trim() || null,
+        security_blocked_at: row.security_blocked_at || null,
+        security_risk_reset_at: row.security_risk_reset_at || null,
+        latest_provider_loss_amount: Number(row.latest_provider_loss_amount || 0),
+        total_provider_loss: Number(row.total_provider_loss || 0),
+        confirmed_provider_loss_count: Number(row.confirmed_provider_loss_count || 0)
     };
 }
 
@@ -456,6 +461,49 @@ function isProviderNonPendingStatus(status) {
 
 function getProviderOrderStatus(order) {
     return String(order?.provider_final_status || order?.provider_status || order?.provider_last_status || '').trim() || null;
+}
+
+function isProviderBenignRefundStatus(status) {
+    const normalizedStatus = String(status || '').trim().toUpperCase();
+    return !normalizedStatus
+        || normalizedStatus === ORDER_PROVIDER_WAITING_STATUS
+        || normalizedStatus === 'ACCESS_CANCEL'
+        || normalizedStatus === 'STATUS_CANCEL'
+        || normalizedStatus === 'EXPIRED'
+        || normalizedStatus === 'STATUS_EXPIRED'
+        || normalizedStatus === 'CANCELLED'
+        || normalizedStatus === 'CANCELED'
+        || normalizedStatus === 'STATUS_CANCELLED'
+        || normalizedStatus === 'STATUS_CANCELED';
+}
+
+function getOrderRiskEventTimestamp(order) {
+    return toIsoTimestamp(
+        order?.refunded_at
+            || order?.completed_at
+            || order?.provider_status_synced_at
+            || order?.sms_received_at
+            || order?.created_at,
+        toIsoTimestamp(order?.created_at, new Date().toISOString())
+    );
+}
+
+function getConfirmedProviderLossAmount(order) {
+    return roundMoney(Math.max(0, -getRealProfitLossAmount(order)));
+}
+
+function isNormalResolvedRefund(order) {
+    const normalizedStatus = normalizeOrderStatus(order);
+    const providerStatus = getProviderOrderStatus(order);
+    return ['cancelled', 'expired'].includes(normalizedStatus)
+        && getWebsiteRefundAmount(order) > 0
+        && !hasStoredOtp(order)
+        && !isProviderSuccessStatus(providerStatus)
+        && isProviderBenignRefundStatus(providerStatus);
+}
+
+function isAutoSecurityBlockReason(reason) {
+    return String(reason || '').trim().toLowerCase() === 'auto_block_confirmed_provider_loss';
 }
 
 function buildRefundDecision(order, providerSignal = null) {
@@ -641,45 +689,43 @@ function computeProviderRefundRecoveryMetrics(order, { balanceBeforeAction, bala
 function evaluateOrderRiskFlags(order) {
     const reasons = [];
     const details = [];
-    const websiteCharge = getWebsiteChargeAmount(order);
     const websiteRefund = getWebsiteRefundAmount(order);
     const realProviderCost = getRealProviderCostAmount(order);
     const providerStatus = getProviderOrderStatus(order);
-    const rawStatus = getRawOrderStatus(order);
-    const providerUsed = isProviderUsedOrder(order);
-    if (websiteRefund > 0 && (hasStoredOtp(order) || order?.sms_received)) {
-        reasons.push('otp_or_sms_refunded');
-        details.push('OTP or SMS was received while a refund was issued.');
+    const providerSuccess = isProviderSuccessStatus(providerStatus);
+    const otpExists = hasStoredOtp(order);
+    const confirmedLossAmount = getConfirmedProviderLossAmount(order);
+    const normalResolvedRefund = isNormalResolvedRefund(order);
+    if (confirmedLossAmount <= PROVIDER_BALANCE_EPSILON || realProviderCost <= PROVIDER_BALANCE_EPSILON || normalResolvedRefund) {
+        return {
+            riskFlag: false,
+            lossDetected: false,
+            criticalExploit: false,
+            exploitReason: null,
+            exploitReasonDetail: null,
+            confirmedLossAmount: 0,
+            reasons
+        };
     }
-    if (websiteRefund > 0 && realProviderCost > 0) {
-        reasons.push('provider_cost_refunded');
-        details.push('Provider balance/cost was charged while the website issued a refund.');
+    if (websiteRefund > 0 && otpExists) {
+        reasons.push('confirmed_provider_loss_refunded_with_otp');
+        details.push('A real provider loss remained after the user received OTP and still got refunded.');
+    } else if (websiteRefund > 0 && providerSuccess) {
+        reasons.push('confirmed_provider_loss_refunded_after_provider_success');
+        details.push('A real provider loss remained after provider success/completion while the user was refunded.');
+    } else {
+        reasons.push('confirmed_provider_loss_unrecovered');
+        details.push('A real unrecovered provider loss was recorded for this order.');
     }
-    if (rawStatus === 'cancelled' && providerUsed) {
-        reasons.push('cancelled_after_provider_use');
-        details.push('Order was cancelled after a provider success/non-pending signal.');
-    }
-    if (websiteRefund > 0 && isProviderNonPendingStatus(providerStatus)) {
-        reasons.push('provider_non_pending_refunded');
-        details.push('Provider reported a non-pending state while the website refunded the user.');
-    }
-    if (realProviderCost > 0 && websiteCharge <= 0) {
-        reasons.push('provider_charged_without_website_charge');
-        details.push('Provider charged balance while the website recorded no charge.');
-    }
-    const criticalReasons = new Set([
-        'otp_or_sms_refunded',
-        'provider_cost_refunded',
-        'cancelled_after_provider_use',
-        'provider_non_pending_refunded',
-        'provider_charged_without_website_charge'
-    ]);
+    const criticalExploit = reasons.includes('confirmed_provider_loss_refunded_with_otp')
+        || reasons.includes('confirmed_provider_loss_refunded_after_provider_success');
     return {
-        riskFlag: reasons.length > 0,
-        lossDetected: reasons.some((reason) => criticalReasons.has(reason)),
-        criticalExploit: reasons.some((reason) => criticalReasons.has(reason)),
+        riskFlag: true,
+        lossDetected: true,
+        criticalExploit,
         exploitReason: reasons[0] || null,
         exploitReasonDetail: details.join(' ') || null,
+        confirmedLossAmount,
         reasons
     };
 }
@@ -1023,6 +1069,9 @@ async function initDB() {
     await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_risk_score INTEGER DEFAULT 0');
     await queryRun("ALTER TABLE users ADD COLUMN IF NOT EXISTS security_risk_status TEXT DEFAULT 'safe'");
     await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_last_flagged_at TIMESTAMPTZ');
+    await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_block_reason TEXT');
+    await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_blocked_at TIMESTAMPTZ');
+    await queryRun('ALTER TABLE users ADD COLUMN IF NOT EXISTS security_risk_reset_at TIMESTAMPTZ');
     await queryRun("UPDATE users SET is_admin = TRUE WHERE LOWER(COALESCE(role, 'user')) = 'admin'");
     await queryRun('CREATE UNIQUE INDEX IF NOT EXISTS users_googleId_unique_idx ON users ("googleId") WHERE "googleId" IS NOT NULL');
     await queryRun('CREATE INDEX IF NOT EXISTS idx_users_referred_by_user_id ON users (referred_by_user_id)');
@@ -1980,6 +2029,14 @@ async function getOrdersByUser(userId) {
 }
 
 async function getAdminUsers() {
+    const realProfitLossExpression = `COALESCE(o.real_profit_loss, (COALESCE(o.website_charge, COALESCE(o.price, 0)) - COALESCE(o.website_refund, 0) - COALESCE(o.real_provider_cost, 0)))`;
+    const providerStatusExpression = `UPPER(COALESCE(NULLIF(TRIM(o.provider_final_status), ''), NULLIF(TRIM(o.provider_status), ''), NULLIF(TRIM(o.provider_last_status), ''), ''))`;
+    const hasOtpExpression = `(COALESCE(o.otp_received, FALSE) = TRUE OR NULLIF(TRIM(COALESCE(o.otp_code, '')), '') IS NOT NULL)`;
+    const providerSuccessExpression = `(${providerStatusExpression} LIKE 'STATUS_OK%' OR ${providerStatusExpression} ~ '(^|[_\\s-])SUCCESS($|[_\\s-])' OR ${providerStatusExpression} ~ '(^|[_\\s-])COMPLETED($|[_\\s-])')`;
+    const benignRefundStatusExpression = `(${providerStatusExpression} = '' OR ${providerStatusExpression} = '${ORDER_PROVIDER_WAITING_STATUS}' OR ${providerStatusExpression} IN ('ACCESS_CANCEL', 'STATUS_CANCEL', 'EXPIRED', 'STATUS_EXPIRED', 'CANCELLED', 'CANCELED', 'STATUS_CANCELLED', 'STATUS_CANCELED'))`;
+    const normalResolvedRefundExpression = `(LOWER(COALESCE(o.status, o.order_status, 'pending')) IN ('cancelled', 'expired', 'expired_refunded', 'refunded') AND COALESCE(o.website_refund, 0) > 0 AND NOT ${hasOtpExpression} AND NOT ${providerSuccessExpression} AND ${benignRefundStatusExpression})`;
+    const confirmedLossExpression = `(GREATEST(-(${realProfitLossExpression}), 0) > 0 AND COALESCE(o.real_provider_cost, 0) > 0 AND NOT ${normalResolvedRefundExpression})`;
+    const lossEventAtExpression = `COALESCE(o.refunded_at, o.completed_at, o.provider_status_synced_at, o.created_at)`;
     const rows = await queryAll(`
         SELECT
             u.id,
@@ -1992,36 +2049,71 @@ async function getAdminUsers() {
             u.security_risk_score,
             u.security_risk_status,
             u.security_blocked_until,
+            u.security_block_reason,
+            u.security_blocked_at,
+            u.security_risk_reset_at,
             u.security_last_flagged_at,
-            latest_event.reason AS latest_security_reason,
-            latest_event.created_at AS latest_security_event_at,
-            latest_event.order_id AS latest_security_order_id,
-            latest_event.service_type AS latest_security_service,
-            latest_event.phone_number AS latest_security_number,
-            GREATEST(COALESCE(-latest_event.real_profit_loss, 0), COALESCE(latest_event.real_provider_cost, 0), 0)::numeric AS latest_provider_loss_amount
+            latest_loss.reason AS latest_security_reason,
+            latest_loss.created_at AS latest_security_event_at,
+            latest_loss.order_id AS latest_security_order_id,
+            latest_loss.service_type AS latest_security_service,
+            latest_loss.phone_number AS latest_security_number,
+            COALESCE(latest_loss.provider_loss_amount, 0)::numeric AS latest_provider_loss_amount,
+            COALESCE(loss_totals.total_provider_loss, 0)::numeric AS total_provider_loss,
+            COALESCE(loss_totals.confirmed_provider_loss_count, 0)::int AS confirmed_provider_loss_count
         FROM users u
         LEFT JOIN LATERAL (
-            SELECT *
-            FROM provider_security_events pse
-            WHERE pse.user_id = u.id
-              AND (
-                  pse.reason IN (
-                      'otp_or_sms_refunded',
-                      'provider_cost_refunded',
-                      'provider_non_pending_refunded',
-                      'cancelled_after_provider_use',
-                      'provider_charged_without_website_charge'
-                  )
-                  OR pse.risk_flag = TRUE
-                  OR pse.loss_detected = TRUE
-                  OR pse.critical_exploit = TRUE
-              )
-            ORDER BY pse.created_at DESC, pse.id DESC
+            SELECT
+                o.id AS order_id,
+                COALESCE(o.service_type, o.provider_service, 'unknown') AS service_type,
+                o.phone_number,
+                ${lossEventAtExpression} AS created_at,
+                GREATEST(-(${realProfitLossExpression}), 0)::numeric AS provider_loss_amount,
+                CASE
+                    WHEN COALESCE(o.website_refund, 0) > 0 AND ${hasOtpExpression} THEN 'confirmed_provider_loss_refunded_with_otp'
+                    WHEN COALESCE(o.website_refund, 0) > 0 AND ${providerSuccessExpression} THEN 'confirmed_provider_loss_refunded_after_provider_success'
+                    ELSE 'confirmed_provider_loss_unrecovered'
+                END AS reason
+            FROM orders o
+            WHERE o.user_id = u.id
+              AND ${confirmedLossExpression}
+              AND (u.security_risk_reset_at IS NULL OR ${lossEventAtExpression} > u.security_risk_reset_at)
+            ORDER BY ${lossEventAtExpression} DESC, o.id DESC
             LIMIT 1
-        ) latest_event ON TRUE
+        ) latest_loss ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*)::int AS confirmed_provider_loss_count,
+                COALESCE(SUM(GREATEST(-(${realProfitLossExpression}), 0)), 0)::numeric AS total_provider_loss
+            FROM orders o
+            WHERE o.user_id = u.id
+              AND ${confirmedLossExpression}
+              AND (u.security_risk_reset_at IS NULL OR ${lossEventAtExpression} > u.security_risk_reset_at)
+        ) loss_totals ON TRUE
         ORDER BY u.id DESC
     `);
-    return rows.map(normalizeUser);
+    return rows.map((row) => {
+        const normalizedUser = normalizeUser(row);
+        const confirmedProviderLossCount = Number(normalizedUser?.confirmed_provider_loss_count || 0);
+        const derivedRiskScore = confirmedProviderLossCount >= 3
+            ? 90
+            : confirmedProviderLossCount === 2
+                ? 60
+                : confirmedProviderLossCount === 1
+                    ? 30
+                    : 0;
+        const derivedRiskStatus = confirmedProviderLossCount >= 3
+            ? 'dangerous'
+            : (confirmedProviderLossCount > 0 ? 'suspicious' : 'safe');
+        const activeBlock = normalizedUser?.security_blocked_until
+            ? new Date(normalizedUser.security_blocked_until) > new Date()
+            : false;
+        return {
+            ...normalizedUser,
+            security_risk_score: activeBlock ? Math.max(80, derivedRiskScore) : derivedRiskScore,
+            security_risk_status: activeBlock ? 'dangerous' : derivedRiskStatus
+        };
+    });
 }
 
 async function getAllBalanceAdjustments(limit = 300) {
@@ -2049,12 +2141,21 @@ async function getUserCombinedHistory(userId, limit = 300) {
         SELECT *
         FROM (
             SELECT
-                'purchase'::text AS entry_type,
+                'order'::text AS entry_type,
                 o.id::text AS reference_id,
-                -COALESCE(o.price, 0)::numeric AS amount,
+                COALESCE(o.price, 0)::numeric AS amount,
                 CONCAT(COALESCE(o.service_name, 'Service'), ' • ', COALESCE(o.country, 'Unknown country')) AS details,
                 COALESCE(o.status, o.order_status, 'pending') AS status,
-                o.created_at AS created_at
+                COALESCE(o.refunded_at, o.completed_at, o.provider_status_synced_at, o.created_at) AS created_at,
+                COALESCE(o.website_refund, 0)::numeric AS refund_amount,
+                COALESCE(o.real_provider_cost, 0)::numeric AS provider_deduction_amount,
+                (COALESCE(o.otp_received, FALSE) = TRUE OR NULLIF(TRIM(COALESCE(o.otp_code, '')), '') IS NOT NULL) AS otp_received,
+                NULLIF(TRIM(COALESCE(o.otp_code, '')), '') AS otp_code,
+                COALESCE(o.provider_final_status, o.provider_status, o.provider_last_status, '') AS provider_status,
+                GREATEST(-COALESCE(o.real_profit_loss, (COALESCE(o.website_charge, COALESCE(o.price, 0)) - COALESCE(o.website_refund, 0) - COALESCE(o.real_provider_cost, 0))), 0)::numeric AS provider_loss_amount,
+                COALESCE(o.phone_number, '') AS phone_number,
+                COALESCE(o.service_type, '') AS service_type,
+                COALESCE(o.country, '') AS country
             FROM orders o
             WHERE o.user_id = $1
 
@@ -2066,7 +2167,16 @@ async function getUserCombinedHistory(userId, limit = 300) {
                 COALESCE(t.amount, 0)::numeric AS amount,
                 COALESCE(t.description, 'Wallet deposit approved') AS details,
                 COALESCE(t.status, 'approved') AS status,
-                t.created_at AS created_at
+                t.created_at AS created_at,
+                0::numeric AS refund_amount,
+                0::numeric AS provider_deduction_amount,
+                FALSE AS otp_received,
+                NULL::text AS otp_code,
+                NULL::text AS provider_status,
+                0::numeric AS provider_loss_amount,
+                NULL::text AS phone_number,
+                NULL::text AS service_type,
+                NULL::text AS country
             FROM transactions t
             WHERE t.user_id = $1
               AND LOWER(COALESCE(t.type, '')) IN ('deposit', 'referral_bonus')
@@ -2079,7 +2189,16 @@ async function getUserCombinedHistory(userId, limit = 300) {
                 COALESCE(ba.amount, 0)::numeric AS amount,
                 ba.reason AS details,
                 'approved'::text AS status,
-                ba.created_at AS created_at
+                ba.created_at AS created_at,
+                0::numeric AS refund_amount,
+                0::numeric AS provider_deduction_amount,
+                FALSE AS otp_received,
+                NULL::text AS otp_code,
+                NULL::text AS provider_status,
+                0::numeric AS provider_loss_amount,
+                NULL::text AS phone_number,
+                NULL::text AS service_type,
+                NULL::text AS country
             FROM balance_adjustments ba
             WHERE ba.user_id = $1
         ) ledger
@@ -2088,7 +2207,11 @@ async function getUserCombinedHistory(userId, limit = 300) {
     `, [userId, limit]);
     return rows.map((row) => ({
         ...row,
-        amount: Number(row.amount || 0)
+        amount: Number(row.amount || 0),
+        refund_amount: Number(row.refund_amount || 0),
+        provider_deduction_amount: Number(row.provider_deduction_amount || 0),
+        otp_received: Boolean(row.otp_received),
+        provider_loss_amount: Number(row.provider_loss_amount || 0)
     }));
 }
 
@@ -2274,16 +2397,24 @@ async function applyAdminUserSecurityAction({ userId, action, reason, hours }) {
         const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [normalizedUserId]);
         const user = normalizeUser(userRes.rows[0]);
         if (!user) throw new Error('User not found');
+        const actionTime = new Date().toISOString();
         let blockedUntil = user.security_blocked_until || null;
         let riskScore = Number(user.security_risk_score || 0);
         let riskStatus = String(user.security_risk_status || 'safe').trim().toLowerCase() || 'safe';
+        let blockReason = user.security_block_reason || null;
+        let blockedAt = user.security_blocked_at || null;
+        let riskResetAt = user.security_risk_reset_at || null;
         if (normalizedAction === 'block') {
             const blockHours = Math.max(1, Math.min(720, Number(hours || 24)));
             blockedUntil = new Date(Date.now() + blockHours * 60 * 60 * 1000).toISOString();
             riskScore = Math.max(riskScore, 80);
             riskStatus = 'dangerous';
+            blockReason = String(reason || '').trim() || 'Manual admin block pending provider-loss review';
+            blockedAt = actionTime;
         } else if (normalizedAction === 'unblock') {
             blockedUntil = null;
+            blockReason = null;
+            blockedAt = null;
             if (riskStatus === 'dangerous' && riskScore >= 80) {
                 riskStatus = riskScore > 0 ? 'suspicious' : 'safe';
             }
@@ -2291,19 +2422,28 @@ async function applyAdminUserSecurityAction({ userId, action, reason, hours }) {
             blockedUntil = null;
             riskScore = 0;
             riskStatus = 'safe';
+            blockReason = null;
+            blockedAt = null;
+            riskResetAt = actionTime;
         }
         const result = await client.query(`
             UPDATE users
             SET security_risk_score = $1,
                 security_risk_status = $2,
                 security_blocked_until = $3,
+                security_block_reason = $4,
+                security_blocked_at = $5,
+                security_risk_reset_at = $6,
                 security_last_flagged_at = CASE WHEN $1 > 0 THEN COALESCE(security_last_flagged_at, CURRENT_TIMESTAMP) ELSE security_last_flagged_at END
-            WHERE id = $4
+            WHERE id = $7
             RETURNING *
         `, [
             riskScore,
             riskStatus,
             blockedUntil,
+            blockReason,
+            blockedAt,
+            riskResetAt,
             normalizedUserId
         ]);
         await client.query('COMMIT');
@@ -2502,6 +2642,73 @@ async function insertProviderSecurityEvent(order, details = {}, options = {}) {
     return result.rows[0] || null;
 }
 
+function deriveUserSecurityMetricsFromOrders(user, orders = []) {
+    const resetAtMs = user?.security_risk_reset_at ? Date.parse(user.security_risk_reset_at) : NaN;
+    const recentThreshold = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const confirmedLossOrders = [];
+    for (const row of Array.isArray(orders) ? orders : []) {
+        const normalizedOrder = normalizeOrder(row);
+        if (!normalizedOrder) continue;
+        const derivedOrder = buildDerivedOrderMetrics(normalizedOrder);
+        if (!derivedOrder?.riskState?.lossDetected) continue;
+        const eventAt = Date.parse(getOrderRiskEventTimestamp(derivedOrder));
+        if (Number.isFinite(resetAtMs) && Number.isFinite(eventAt) && eventAt <= resetAtMs) {
+            continue;
+        }
+        confirmedLossOrders.push({
+            order: derivedOrder,
+            eventAt: Number.isFinite(eventAt) ? eventAt : Date.now(),
+            lossAmount: getConfirmedProviderLossAmount(derivedOrder)
+        });
+    }
+    let latestLossOrder = null;
+    let totalProviderLoss = 0;
+    let suspiciousRecent = 0;
+    let otpAfterCancelAttempts = 0;
+    let criticalTotal = 0;
+    let refundsToday = 0;
+    for (const entry of confirmedLossOrders) {
+        totalProviderLoss += entry.lossAmount;
+        if (!latestLossOrder || entry.eventAt > latestLossOrder.eventAt) {
+            latestLossOrder = entry;
+        }
+        if (entry.eventAt >= recentThreshold) {
+            suspiciousRecent += 1;
+        }
+        if (entry.order?.riskState?.criticalExploit) {
+            otpAfterCancelAttempts += 1;
+            criticalTotal += 1;
+        }
+        const refundedAt = Date.parse(toIsoTimestamp(entry.order?.refunded_at, ''));
+        if (getWebsiteRefundAmount(entry.order) > 0 && Number.isFinite(refundedAt) && refundedAt >= todayStart.getTime()) {
+            refundsToday += 1;
+        }
+    }
+    const refundAbuseCount = confirmedLossOrders.length;
+    const riskScore = refundAbuseCount >= 3
+        ? 90
+        : refundAbuseCount === 2
+            ? 60
+            : refundAbuseCount === 1
+                ? 30
+                : 0;
+    return {
+        cancellationsLastHour: 0,
+        refundsToday,
+        suspiciousRecent,
+        otpAfterCancelAttempts,
+        refundAbuseCount,
+        criticalTotal,
+        totalProviderLoss: roundMoney(totalProviderLoss),
+        latestLossOrder: latestLossOrder?.order || null,
+        autoBlockEligible: refundAbuseCount >= 3,
+        riskScore,
+        riskStatus: refundAbuseCount >= 3 ? 'dangerous' : (refundAbuseCount > 0 ? 'suspicious' : 'safe')
+    };
+}
+
 async function getUserSecurityMetrics(userId, options = {}) {
     const normalizedUserId = Number(userId);
     if (!Number.isFinite(normalizedUserId) || normalizedUserId <= 0) return null;
@@ -2509,59 +2716,10 @@ async function getUserSecurityMetrics(userId, options = {}) {
     const userRes = await executor.query('SELECT * FROM users WHERE id = $1 LIMIT 1', [normalizedUserId]);
     const user = normalizeUser(userRes.rows[0]);
     if (!user) return null;
-    const metricsRes = await executor.query(`
-        SELECT
-            COUNT(*) FILTER (
-                WHERE reason IN (
-                    'otp_or_sms_refunded',
-                    'provider_cost_refunded',
-                    'provider_non_pending_refunded',
-                    'cancelled_after_provider_use',
-                    'provider_charged_without_website_charge'
-                )
-                  AND created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'
-            )::int AS suspicious_recent,
-            COUNT(*) FILTER (
-                WHERE reason = 'otp_or_sms_refunded'
-            )::int AS otp_after_cancel_attempts,
-            COUNT(*) FILTER (
-                WHERE reason IN (
-                    'otp_or_sms_refunded',
-                    'provider_cost_refunded',
-                    'provider_non_pending_refunded',
-                    'cancelled_after_provider_use',
-                    'provider_charged_without_website_charge'
-                )
-            )::int AS refund_abuse_count,
-            COUNT(*) FILTER (
-                WHERE critical_exploit = TRUE
-            )::int AS critical_total
-        FROM provider_security_events
-        WHERE user_id = $1
-    `, [normalizedUserId]);
-    const row = metricsRes.rows[0] || {};
-    const cancellationsLastHour = 0;
-    const refundsToday = 0;
-    const suspiciousRecent = Number(row.suspicious_recent || 0);
-    const otpAfterCancelAttempts = Number(row.otp_after_cancel_attempts || 0);
-    const refundAbuseCount = Number(row.refund_abuse_count || 0);
-    const criticalTotal = Number(row.critical_total || 0);
-    const riskScore = (
-        refundAbuseCount * 35
-        + otpAfterCancelAttempts * 25
-        + suspiciousRecent * 20
-        + criticalTotal * 40
-    );
+    const ordersRes = await executor.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY id DESC', [normalizedUserId]);
     return {
         user,
-        cancellationsLastHour,
-        refundsToday,
-        suspiciousRecent,
-        otpAfterCancelAttempts,
-        refundAbuseCount,
-        criticalTotal,
-        riskScore,
-        riskStatus: calculateRiskStatus(riskScore)
+        ...deriveUserSecurityMetricsFromOrders(user, ordersRes.rows)
     };
 }
 
@@ -2571,20 +2729,38 @@ async function syncUserSecurityState(userId, options = {}) {
     const executor = options.client || pool;
     const now = new Date();
     const existingBlockedUntil = metrics.user?.security_blocked_until ? new Date(metrics.user.security_blocked_until) : null;
-    const blockedUntil = existingBlockedUntil && existingBlockedUntil > now ? existingBlockedUntil : null;
+    const existingBlockActive = existingBlockedUntil && existingBlockedUntil > now;
+    let blockedUntil = existingBlockActive ? existingBlockedUntil : null;
+    let blockReason = existingBlockActive ? (metrics.user?.security_block_reason || null) : null;
+    let blockedAt = existingBlockActive ? toIsoTimestamp(metrics.user?.security_blocked_at, now.toISOString()) : null;
+    if (metrics.autoBlockEligible) {
+        if (!blockedUntil || isAutoSecurityBlockReason(blockReason)) {
+            blockedUntil = new Date(now.getTime() + SECURITY_AUTO_BLOCK_HOURS * 60 * 60 * 1000);
+            blockReason = 'auto_block_confirmed_provider_loss';
+            blockedAt = blockedAt || now.toISOString();
+        }
+    } else if (!existingBlockActive) {
+        blockedUntil = null;
+        blockReason = null;
+        blockedAt = null;
+    }
     const blockedUntilIso = blockedUntil ? blockedUntil.toISOString() : null;
     const result = await executor.query(`
         UPDATE users
         SET security_risk_score = $1,
             security_risk_status = $2,
             security_blocked_until = $3,
+            security_block_reason = $4,
+            security_blocked_at = $5,
             security_last_flagged_at = CASE WHEN $1 > 0 THEN CURRENT_TIMESTAMP ELSE security_last_flagged_at END
-        WHERE id = $4
+        WHERE id = $6
         RETURNING *
     `, [
         metrics.riskScore,
         metrics.riskStatus,
         blockedUntilIso,
+        blockReason,
+        blockedAt,
         Number(userId)
     ]);
     return {
@@ -2680,11 +2856,11 @@ async function syncOrderFinancialProtection(order, details = {}, options = {}) {
         syncNumberHistory: details.syncNumberHistory
     });
     const finalOrder = updatedOrder || normalizeOrder({ ...normalizedOrder, ...updates });
-    const shouldRecordEvent = Boolean(details.securityEventType)
+    const shouldRecordEvent = Boolean(details.recordSecurityEvent)
         || (details.recordRiskEvent !== false && finalOrder?.risk_flag);
     if (shouldRecordEvent) {
         await insertProviderSecurityEvent(finalOrder, {
-            eventType: details.securityEventType || (finalOrder?.critical_exploit ? 'critical_exploit_detected' : 'risk_flag_detected'),
+            eventType: finalOrder?.loss_detected ? 'confirmed_provider_loss' : (details.securityEventType || (finalOrder?.critical_exploit ? 'critical_exploit_detected' : 'risk_flag_detected')),
             reason: details.reason || finalOrder?.exploit_reason || null,
             riskFlag: finalOrder?.risk_flag,
             lossDetected: finalOrder?.loss_detected,
@@ -3289,33 +3465,36 @@ function normalizeProviderSecurityEventEntry(row) {
     };
 }
 
+function getAdminAnalyticsDateKey(value) {
+    const date = value ? new Date(value) : null;
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
 async function getAdminProviderAnalytics(options = {}) {
     const snapshotLimit = Math.max(5, Math.min(100, Number(options.snapshotLimit || 20)));
     const eventLimit = Math.max(5, Math.min(100, Number(options.eventLimit || 25)));
     const topRiskUserLimit = Math.max(5, Math.min(50, Number(options.topRiskUserLimit || 15)));
-    const [orderSummaryRow, userSummaryRow, latestSnapshotRow, serviceBreakdownRows, recentSnapshotRows, recentEventRows, topRiskUserRows, todayOrderSummaryRow, todayProviderBalanceRow] = await Promise.all([
-        queryOne(`
+    const blockedUserLimit = Math.max(5, Math.min(50, Number(options.blockedUserLimit || 20)));
+    const dailyEarningsLimit = Math.max(7, Math.min(60, Number(options.dailyEarningsLimit || 14)));
+    const [orders, userRows, latestSnapshotRow, recentSnapshotRows, providerBalanceSummaryRow, providerBalanceDailyRows, depositSummaryRow, anomalyEventRows] = await Promise.all([
+        getAllOrders(),
+        queryAll(`
             SELECT
-                COUNT(*)::int AS total_orders,
-                COUNT(*) FILTER (WHERE provider_used = TRUE)::int AS provider_used_orders,
-                COUNT(*) FILTER (WHERE risk_flag = TRUE)::int AS risk_orders,
-                COUNT(*) FILTER (WHERE loss_detected = TRUE)::int AS loss_orders,
-                COUNT(*) FILTER (WHERE critical_exploit = TRUE)::int AS critical_orders,
-                COUNT(*) FILTER (WHERE website_refund > 0)::int AS refunded_orders,
-                COALESCE(SUM(website_charge), 0)::numeric AS total_website_charge,
-                COALESCE(SUM(website_refund), 0)::numeric AS total_website_refund,
-                COALESCE(SUM(website_profit), 0)::numeric AS total_website_profit,
-                COALESCE(SUM(real_provider_cost), 0)::numeric AS total_real_provider_cost,
-                COALESCE(SUM(real_profit_loss), 0)::numeric AS total_real_profit_loss
-            FROM orders
-        `),
-        queryOne(`
-            SELECT
-                COUNT(*) FILTER (WHERE security_risk_status <> 'safe')::int AS risky_users,
-                COUNT(*) FILTER (WHERE security_blocked_until > CURRENT_TIMESTAMP)::int AS blocked_users,
-                COALESCE(MAX(security_risk_score), 0)::numeric AS max_risk_score,
-                COALESCE(SUM(balance), 0)::numeric AS total_user_balances
+                id,
+                name,
+                email,
+                balance,
+                security_blocked_until,
+                security_block_reason,
+                security_blocked_at,
+                security_risk_reset_at,
+                security_last_flagged_at
             FROM users
+            ORDER BY id DESC
         `),
         queryOne(`
             SELECT *
@@ -3324,69 +3503,29 @@ async function getAdminProviderAnalytics(options = {}) {
             LIMIT 1
         `),
         queryAll(`
-            SELECT
-                COALESCE(provider_service, service_type, 'unknown') AS provider_service,
-                COUNT(*)::int AS total_orders,
-                COUNT(*) FILTER (WHERE risk_flag = TRUE)::int AS risk_orders,
-                COALESCE(SUM(real_provider_cost), 0)::numeric AS total_real_provider_cost,
-                COALESCE(SUM(real_profit_loss), 0)::numeric AS total_real_profit_loss
-            FROM orders
-            GROUP BY COALESCE(provider_service, service_type, 'unknown')
-            ORDER BY total_real_provider_cost DESC, total_orders DESC
-            LIMIT 10
-        `),
-        queryAll(`
             SELECT *
             FROM provider_balance_snapshots
             ORDER BY created_at DESC, id DESC
             LIMIT $1
         `, [snapshotLimit]),
-        queryAll(`
-            SELECT *
-            FROM provider_security_events
-            WHERE risk_flag = TRUE
-               OR loss_detected = TRUE
-               OR critical_exploit = TRUE
-               OR event_type = 'provider_reconciliation_anomaly'
-            ORDER BY created_at DESC, id DESC
-            LIMIT $1
-        `, [eventLimit]),
-        queryAll(`
-            SELECT
-                id,
-                name,
-                email,
-                balance,
-                security_risk_score,
-                security_risk_status,
-                security_blocked_until,
-                security_last_flagged_at
-            FROM users
-            WHERE COALESCE(security_risk_score, 0) > 0
-               OR security_blocked_until > CURRENT_TIMESTAMP
-               OR COALESCE(security_risk_status, 'safe') <> 'safe'
-            ORDER BY COALESCE(security_risk_score, 0) DESC, security_blocked_until DESC NULLS LAST, id DESC
-            LIMIT $1
-        `, [topRiskUserLimit]),
         queryOne(`
             SELECT
-                COALESCE(SUM(real_provider_cost) FILTER (
-                    WHERE created_at >= CURRENT_DATE
-                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
-                ), 0)::numeric AS today_api_cost,
-                COALESCE(SUM(real_profit_loss) FILTER (
-                    WHERE created_at >= CURRENT_DATE
-                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
-                ), 0)::numeric AS today_real_profit_loss
-            FROM orders
-        `),
-        queryOne(`
-            SELECT
+                COALESCE(SUM(GREATEST(delta_pkr, 0)) FILTER (
+                    WHERE reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                ), 0)::numeric AS total_api_cost,
+                COALESCE(SUM(delta_pkr) FILTER (
+                    WHERE reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                ), 0)::numeric AS total_provider_balance_change,
                 COALESCE(SUM(GREATEST(delta_pkr, 0)) FILTER (
                     WHERE created_at >= CURRENT_DATE
                       AND created_at < CURRENT_DATE + INTERVAL '1 day'
                       AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
-                ), 0)::numeric AS today_provider_deductions,
+                ), 0)::numeric AS today_api_cost,
+                COALESCE(SUM(delta_pkr) FILTER (
+                    WHERE created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                      AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                ), 0)::numeric AS today_provider_balance_change,
                 COALESCE(SUM(expected_spend_pkr) FILTER (
                     WHERE created_at >= CURRENT_DATE
                       AND created_at < CURRENT_DATE + INTERVAL '1 day'
@@ -3403,55 +3542,340 @@ async function getAdminProviderAnalytics(options = {}) {
                       AND anomaly_flag = TRUE
                 )::int AS today_anomaly_count
             FROM provider_balance_snapshots
-        `)
+        `),
+        queryAll(`
+            SELECT
+                TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') AS date_key,
+                COALESCE(SUM(GREATEST(delta_pkr, 0)), 0)::numeric AS api_cost,
+                COALESCE(SUM(delta_pkr), 0)::numeric AS provider_balance_change
+            FROM provider_balance_snapshots
+            WHERE reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+            GROUP BY 1
+            ORDER BY 1 DESC
+            LIMIT $1
+        `, [dailyEarningsLimit]),
+        queryOne(`
+            SELECT
+                COALESCE(SUM(amount) FILTER (
+                    WHERE LOWER(COALESCE(type, '')) = 'deposit'
+                      AND LOWER(COALESCE(status, '')) = 'approved'
+                ), 0)::numeric AS total_deposits,
+                COALESCE(SUM(amount) FILTER (
+                    WHERE LOWER(COALESCE(type, '')) = 'deposit'
+                      AND LOWER(COALESCE(status, '')) = 'approved'
+                      AND created_at >= CURRENT_DATE
+                      AND created_at < CURRENT_DATE + INTERVAL '1 day'
+                ), 0)::numeric AS today_deposits
+            FROM transactions
+        `),
+        queryAll(`
+            SELECT *
+            FROM provider_security_events
+            WHERE event_type = 'provider_reconciliation_anomaly'
+            ORDER BY created_at DESC, id DESC
+            LIMIT $1
+        `, [eventLimit])
     ]);
 
-    const latestSnapshot = normalizeProviderBalanceSnapshotEntry(latestSnapshotRow);
-    const todayProviderDeductions = Number(todayProviderBalanceRow?.today_provider_deductions || 0);
-    const todayExpectedProviderSpend = Number(todayProviderBalanceRow?.today_expected_provider_spend || 0);
-    const todayUnmatchedProviderDelta = Number(todayProviderBalanceRow?.today_unmatched_provider_delta || 0);
-    const todayLossWarning = todayProviderDeductions > (todayExpectedProviderSpend + Math.max(50, Math.abs(todayExpectedProviderSpend) * 0.25));
+    const users = userRows.map(normalizeUser);
+    const normalizedLatestSnapshot = normalizeProviderBalanceSnapshotEntry(latestSnapshotRow);
+    const recentBalanceSnapshots = recentSnapshotRows.map(normalizeProviderBalanceSnapshotEntry);
+    const providerBalanceSummary = {
+        totalApiCost: Number(providerBalanceSummaryRow?.total_api_cost || 0),
+        totalProviderBalanceChange: Number(providerBalanceSummaryRow?.total_provider_balance_change || 0),
+        todayApiCost: Number(providerBalanceSummaryRow?.today_api_cost || 0),
+        todayProviderBalanceChange: Number(providerBalanceSummaryRow?.today_provider_balance_change || 0),
+        todayExpectedProviderSpend: Number(providerBalanceSummaryRow?.today_expected_provider_spend || 0),
+        todayUnmatchedProviderDelta: Number(providerBalanceSummaryRow?.today_unmatched_provider_delta || 0),
+        todayAnomalyCount: Number(providerBalanceSummaryRow?.today_anomaly_count || 0)
+    };
+    const todayKey = getAdminAnalyticsDateKey(new Date());
+    const userLookup = new Map(users.map((user) => [String(user.id), user]));
+    const ordersByUser = new Map();
+    const serviceBreakdownMap = new Map();
+    const dailyEarningsMap = new Map();
+    const riskEvents = [];
+    let totalOrders = 0;
+    let providerUsedOrders = 0;
+    let riskOrders = 0;
+    let lossOrders = 0;
+    let criticalOrders = 0;
+    let refundedOrders = 0;
+    let totalWebsiteCharge = 0;
+    let totalWebsiteRefund = 0;
+    let totalWebsiteProfit = 0;
+    let totalRealProviderCost = 0;
+    let totalRevenue = 0;
+
+    const ensureDailyEntry = (dateKey) => {
+        if (!dateKey) return null;
+        if (!dailyEarningsMap.has(dateKey)) {
+            dailyEarningsMap.set(dateKey, {
+                date: dateKey,
+                revenue: 0,
+                apiCost: 0,
+                profitLoss: 0,
+                refunds: 0,
+                completedOrders: 0,
+                cancelledOrders: 0,
+                providerBalanceChange: 0
+            });
+        }
+        return dailyEarningsMap.get(dateKey);
+    };
+
+    for (const rawOrder of orders) {
+        const order = buildDerivedOrderMetrics(rawOrder);
+        const websiteCharge = getWebsiteChargeAmount(order);
+        const websiteRefund = getWebsiteRefundAmount(order);
+        const websiteProfit = roundMoney(websiteCharge - websiteRefund);
+        const realProviderCost = getRealProviderCostAmount(order);
+        const realProfitLoss = getRealProfitLossAmount(order);
+        const lifecycleStatus = normalizeOrderStatus(order);
+        const serviceKey = String(order?.provider_service || order?.service_type || 'unknown').trim() || 'unknown';
+        const userIdKey = order?.user_id == null ? null : String(order.user_id);
+        totalOrders += 1;
+        if (order?.provider_used) {
+            providerUsedOrders += 1;
+        }
+        if (order?.riskState?.riskFlag) {
+            riskOrders += 1;
+        }
+        if (order?.riskState?.lossDetected) {
+            lossOrders += 1;
+        }
+        if (order?.riskState?.criticalExploit) {
+            criticalOrders += 1;
+        }
+        if (websiteRefund > 0) {
+            refundedOrders += 1;
+        }
+        totalWebsiteCharge += websiteCharge;
+        totalWebsiteRefund += websiteRefund;
+        totalWebsiteProfit += websiteProfit;
+        totalRealProviderCost += realProviderCost;
+
+        if (!serviceBreakdownMap.has(serviceKey)) {
+            serviceBreakdownMap.set(serviceKey, {
+                provider_service: serviceKey,
+                total_orders: 0,
+                risk_orders: 0,
+                total_real_provider_cost: 0,
+                total_real_profit_loss: 0
+            });
+        }
+        const serviceEntry = serviceBreakdownMap.get(serviceKey);
+        serviceEntry.total_orders += 1;
+        serviceEntry.total_real_provider_cost += realProviderCost;
+        serviceEntry.total_real_profit_loss += realProfitLoss;
+        if (order?.riskState?.riskFlag) {
+            serviceEntry.risk_orders += 1;
+        }
+
+        if (userIdKey) {
+            if (!ordersByUser.has(userIdKey)) {
+                ordersByUser.set(userIdKey, []);
+            }
+            ordersByUser.get(userIdKey).push(order);
+        }
+
+        if (lifecycleStatus === 'completed') {
+            const completedKey = getAdminAnalyticsDateKey(order?.completed_at || order?.provider_status_synced_at || order?.created_at);
+            const completedEntry = ensureDailyEntry(completedKey);
+            if (completedEntry) {
+                completedEntry.revenue += websiteCharge;
+                completedEntry.completedOrders += 1;
+            }
+            totalRevenue += websiteCharge;
+        }
+
+        if (websiteRefund > 0) {
+            const refundKey = getAdminAnalyticsDateKey(order?.refunded_at || order?.provider_status_synced_at || order?.created_at);
+            const refundEntry = ensureDailyEntry(refundKey);
+            if (refundEntry) {
+                refundEntry.refunds += websiteRefund;
+            }
+        }
+
+        if (lifecycleStatus === 'cancelled') {
+            const cancelledKey = getAdminAnalyticsDateKey(order?.provider_status_synced_at || order?.refunded_at || order?.created_at);
+            const cancelledEntry = ensureDailyEntry(cancelledKey);
+            if (cancelledEntry) {
+                cancelledEntry.cancelledOrders += 1;
+            }
+        }
+
+        if (order?.riskState?.lossDetected) {
+            riskEvents.push(normalizeProviderSecurityEventEntry({
+                order_id: order.id,
+                user_id: order.user_id,
+                username: getOrderUsernameSnapshot(order) || userLookup.get(String(order.user_id || ''))?.name || null,
+                service_type: order.service_type || order.provider_service || null,
+                country: order.country || order.provider_country || null,
+                phone_number: order.phone_number || order.provider_phone_number || null,
+                activation_id: order.activation_id || null,
+                event_type: 'confirmed_provider_loss',
+                reason: order.riskState.exploitReason || null,
+                risk_flag: true,
+                loss_detected: true,
+                critical_exploit: Boolean(order.riskState.criticalExploit),
+                provider_status: order.provider_status || order.provider_last_status || null,
+                provider_final_status: order.provider_final_status || null,
+                provider_balance_before: order.provider_balance_before ?? null,
+                provider_balance_after: order.provider_balance_after ?? null,
+                real_provider_cost: realProviderCost,
+                website_charge: websiteCharge,
+                website_refund: websiteRefund,
+                real_profit_loss: realProfitLoss,
+                created_at: getOrderRiskEventTimestamp(order)
+            }));
+        }
+    }
+
+    for (const row of providerBalanceDailyRows) {
+        const entry = ensureDailyEntry(String(row.date_key || '').trim() || null);
+        if (!entry) continue;
+        entry.apiCost += Number(row.api_cost || 0);
+        entry.providerBalanceChange += Number(row.provider_balance_change || 0);
+    }
+
+    const dailyEarnings = Array.from(dailyEarningsMap.values())
+        .map((entry) => ({
+            ...entry,
+            revenue: roundMoney(entry.revenue),
+            apiCost: roundMoney(entry.apiCost),
+            profitLoss: roundMoney(entry.revenue - entry.apiCost),
+            refunds: roundMoney(entry.refunds),
+            providerBalanceChange: roundMoney(entry.providerBalanceChange)
+        }))
+        .sort((left, right) => String(right.date).localeCompare(String(left.date)))
+        .slice(0, dailyEarningsLimit);
+
+    const todayEntry = dailyEarnings.find((entry) => entry.date === todayKey) || {
+        date: todayKey,
+        revenue: 0,
+        apiCost: 0,
+        profitLoss: 0,
+        refunds: 0,
+        completedOrders: 0,
+        cancelledOrders: 0,
+        providerBalanceChange: 0
+    };
+
+    const enrichedUsers = users.map((user) => {
+        const derivedMetrics = deriveUserSecurityMetricsFromOrders(user, ordersByUser.get(String(user.id)) || []);
+        const activeBlock = user.security_blocked_until ? new Date(user.security_blocked_until) > new Date() : false;
+        return {
+            ...user,
+            total_provider_loss: Number(derivedMetrics.totalProviderLoss || 0),
+            confirmed_provider_loss_count: Number(derivedMetrics.refundAbuseCount || 0),
+            security_risk_score: activeBlock ? Math.max(80, derivedMetrics.riskScore) : derivedMetrics.riskScore,
+            security_risk_status: activeBlock ? 'dangerous' : derivedMetrics.riskStatus,
+            latest_provider_loss_amount: Number(getConfirmedProviderLossAmount(derivedMetrics.latestLossOrder || {}) || 0),
+            latest_security_reason: derivedMetrics.latestLossOrder?.riskState?.exploitReason || null,
+            latest_security_event_at: derivedMetrics.latestLossOrder ? getOrderRiskEventTimestamp(derivedMetrics.latestLossOrder) : null,
+            latest_security_order_id: derivedMetrics.latestLossOrder?.id ?? null,
+            latest_security_service: derivedMetrics.latestLossOrder?.service_type || derivedMetrics.latestLossOrder?.provider_service || null,
+            latest_security_number: derivedMetrics.latestLossOrder?.phone_number || derivedMetrics.latestLossOrder?.provider_phone_number || null
+        };
+    });
+
+    const totalUserBalances = enrichedUsers.reduce((sum, user) => sum + Number(user.balance || 0), 0);
+    const riskyUsers = enrichedUsers.filter((user) => String(user.security_risk_status || 'safe').toLowerCase() !== 'safe').length;
+    const blockedUsers = enrichedUsers.filter((user) => user.security_blocked_until && new Date(user.security_blocked_until) > new Date()).length;
+    const maxRiskScore = enrichedUsers.reduce((max, user) => Math.max(max, Number(user.security_risk_score || 0)), 0);
+
+    const financeSummary = {
+        totalDeposits: Number(depositSummaryRow?.total_deposits || 0),
+        todayDeposits: Number(depositSummaryRow?.today_deposits || 0),
+        totalRevenue: roundMoney(totalRevenue),
+        todayRevenue: roundMoney(todayEntry.revenue || 0),
+        totalIncome: roundMoney(totalRevenue),
+        todayIncome: roundMoney(todayEntry.revenue || 0),
+        totalApiCost: roundMoney(providerBalanceSummary.totalApiCost || 0),
+        todayApiCost: roundMoney(providerBalanceSummary.todayApiCost || 0),
+        totalProfit: roundMoney(totalRevenue - Number(providerBalanceSummary.totalApiCost || 0)),
+        todayProfit: roundMoney((todayEntry.revenue || 0) - Number(providerBalanceSummary.todayApiCost || 0)),
+        todayRefunds: roundMoney(todayEntry.refunds || 0),
+        todayCompletedOrders: Number(todayEntry.completedOrders || 0),
+        todayCancelledOrders: Number(todayEntry.cancelledOrders || 0),
+        todayProviderBalanceChange: roundMoney(providerBalanceSummary.todayProviderBalanceChange || 0),
+        totalProviderBalanceChange: roundMoney(providerBalanceSummary.totalProviderBalanceChange || 0)
+    };
+
+    const summary = {
+        totalOrders,
+        providerUsedOrders,
+        riskOrders,
+        lossOrders,
+        criticalOrders,
+        refundedOrders,
+        totalWebsiteCharge: roundMoney(totalWebsiteCharge),
+        totalWebsiteRefund: roundMoney(totalWebsiteRefund),
+        totalWebsiteProfit: roundMoney(totalWebsiteProfit),
+        totalRealProviderCost: financeSummary.totalApiCost,
+        totalRealProfitLoss: financeSummary.totalProfit,
+        riskyUsers,
+        blockedUsers,
+        maxRiskScore,
+        totalUserBalances: roundMoney(totalUserBalances),
+        todayApiCost: financeSummary.todayApiCost,
+        todayProviderDeductions: financeSummary.todayApiCost,
+        todayRealProfitLoss: financeSummary.todayProfit,
+        todayExpectedProviderSpend: Number(providerBalanceSummary.todayExpectedProviderSpend || 0),
+        todayUnmatchedProviderDelta: Number(providerBalanceSummary.todayUnmatchedProviderDelta || 0),
+        todayAnomalyCount: Number(providerBalanceSummary.todayAnomalyCount || 0),
+        todayLossWarning: Number(providerBalanceSummary.todayApiCost || 0) > (Number(providerBalanceSummary.todayExpectedProviderSpend || 0) + Math.max(50, Math.abs(Number(providerBalanceSummary.todayExpectedProviderSpend || 0)) * 0.25)),
+        latestProviderBalance: normalizedLatestSnapshot?.provider_balance ?? null,
+        latestProviderBalanceCurrency: normalizedLatestSnapshot?.provider_balance == null ? PROVIDER_BALANCE_CURRENCY : (normalizedLatestSnapshot?.provider_balance_currency || PROVIDER_BALANCE_CURRENCY),
+        latestReconciliationAt: normalizedLatestSnapshot?.created_at || null,
+        latestReconciliationReason: normalizedLatestSnapshot?.reason || null,
+        latestUnmatchedDeltaPkr: normalizedLatestSnapshot?.unmatched_delta_pkr || 0,
+        latestAnomalyFlag: Boolean(normalizedLatestSnapshot?.anomaly_flag),
+        todayRevenue: financeSummary.todayRevenue,
+        todayProfit: financeSummary.todayProfit,
+        todayRefunds: financeSummary.todayRefunds,
+        todayCompletedOrders: financeSummary.todayCompletedOrders,
+        todayCancelledOrders: financeSummary.todayCancelledOrders,
+        todayProviderBalanceChange: financeSummary.todayProviderBalanceChange
+    };
+
+    const serviceBreakdown = Array.from(serviceBreakdownMap.values())
+        .map((entry) => ({
+            ...entry,
+            total_real_provider_cost: roundMoney(entry.total_real_provider_cost),
+            total_real_profit_loss: roundMoney(entry.total_real_profit_loss)
+        }))
+        .sort((left, right) => (right.total_real_provider_cost - left.total_real_provider_cost) || (right.total_orders - left.total_orders))
+        .slice(0, 10);
+
+    const recentSecurityEvents = [...riskEvents, ...anomalyEventRows.map(normalizeProviderSecurityEventEntry)]
+        .sort((left, right) => new Date(right.created_at || 0) - new Date(left.created_at || 0))
+        .slice(0, eventLimit);
+
+    const topRiskUsers = [...enrichedUsers]
+        .filter((user) => String(user.security_risk_status || 'safe').toLowerCase() !== 'safe' || (user.security_blocked_until && new Date(user.security_blocked_until) > new Date()))
+        .sort((left, right) => {
+            const scoreDiff = Number(right.security_risk_score || 0) - Number(left.security_risk_score || 0);
+            if (scoreDiff !== 0) return scoreDiff;
+            return Number(right.total_provider_loss || 0) - Number(left.total_provider_loss || 0);
+        })
+        .slice(0, topRiskUserLimit);
+
+    const blockedUsersList = [...enrichedUsers]
+        .filter((user) => user.security_blocked_until && new Date(user.security_blocked_until) > new Date())
+        .sort((left, right) => new Date(right.security_blocked_until || 0) - new Date(left.security_blocked_until || 0))
+        .slice(0, blockedUserLimit);
+
     return {
-        summary: {
-            totalOrders: Number(orderSummaryRow?.total_orders || 0),
-            providerUsedOrders: Number(orderSummaryRow?.provider_used_orders || 0),
-            riskOrders: Number(orderSummaryRow?.risk_orders || 0),
-            lossOrders: Number(orderSummaryRow?.loss_orders || 0),
-            criticalOrders: Number(orderSummaryRow?.critical_orders || 0),
-            refundedOrders: Number(orderSummaryRow?.refunded_orders || 0),
-            totalWebsiteCharge: Number(orderSummaryRow?.total_website_charge || 0),
-            totalWebsiteRefund: Number(orderSummaryRow?.total_website_refund || 0),
-            totalWebsiteProfit: Number(orderSummaryRow?.total_website_profit || 0),
-            totalRealProviderCost: Number(orderSummaryRow?.total_real_provider_cost || 0),
-            totalRealProfitLoss: Number(orderSummaryRow?.total_real_profit_loss || 0),
-            riskyUsers: Number(userSummaryRow?.risky_users || 0),
-            blockedUsers: Number(userSummaryRow?.blocked_users || 0),
-            maxRiskScore: Number(userSummaryRow?.max_risk_score || 0),
-            totalUserBalances: Number(userSummaryRow?.total_user_balances || 0),
-            todayApiCost: Number(todayOrderSummaryRow?.today_api_cost || 0),
-            todayProviderDeductions,
-            todayRealProfitLoss: Number(todayOrderSummaryRow?.today_real_profit_loss || 0),
-            todayExpectedProviderSpend,
-            todayUnmatchedProviderDelta,
-            todayAnomalyCount: Number(todayProviderBalanceRow?.today_anomaly_count || 0),
-            todayLossWarning,
-            latestProviderBalance: latestSnapshot?.provider_balance ?? null,
-            latestProviderBalanceCurrency: latestSnapshot?.provider_balance == null ? PROVIDER_BALANCE_CURRENCY : (latestSnapshot?.provider_balance_currency || PROVIDER_BALANCE_CURRENCY),
-            latestReconciliationAt: latestSnapshot?.created_at || null,
-            latestReconciliationReason: latestSnapshot?.reason || null,
-            latestUnmatchedDeltaPkr: latestSnapshot?.unmatched_delta_pkr || 0,
-            latestAnomalyFlag: Boolean(latestSnapshot?.anomaly_flag)
-        },
-        serviceBreakdown: serviceBreakdownRows.map((row) => ({
-            provider_service: String(row.provider_service || 'unknown').trim() || 'unknown',
-            total_orders: Number(row.total_orders || 0),
-            risk_orders: Number(row.risk_orders || 0),
-            total_real_provider_cost: Number(row.total_real_provider_cost || 0),
-            total_real_profit_loss: Number(row.total_real_profit_loss || 0)
-        })),
-        recentBalanceSnapshots: recentSnapshotRows.map(normalizeProviderBalanceSnapshotEntry),
-        recentSecurityEvents: recentEventRows.map(normalizeProviderSecurityEventEntry),
-        topRiskUsers: topRiskUserRows.map(normalizeUser)
+        summary,
+        financeSummary,
+        dailyEarnings,
+        serviceBreakdown,
+        recentBalanceSnapshots,
+        recentSecurityEvents,
+        topRiskUsers,
+        blockedUsers: blockedUsersList
     };
 }
 
