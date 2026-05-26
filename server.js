@@ -5355,7 +5355,11 @@ const smilesCountries = [
 ];
 
 const anyotherCountries = [
-    { name: 'Indonesia', code: '+62', price: 100, countryId: 6, flag: '🇮🇩' }
+    { name: 'Indonesia', code: '+62', price: 100, countryId: 6, flag: '🇮🇩' },
+    { name: 'United Kingdom', code: '+44', price: 90, countryId: 16, flag: '🇬🇧' },
+    { name: 'Brazil', code: '+55', price: 70, countryId: 73, flag: '🇧🇷' },
+    { name: 'Colombia', code: '+57', price: 70, countryId: 33, flag: '🇨🇴' },
+    { name: 'France', code: '+33', price: 140, countryId: 78, flag: '🇫🇷' }
 ];
 
 const mercadoCountries = [
