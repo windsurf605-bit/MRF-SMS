@@ -116,6 +116,7 @@ const PROVIDER_BALANCE_ACTION = 'getBalance';
 const PROVIDER_BALANCE_CURRENCY = 'USD';
 const PROVIDER_PKR_EXCHANGE_RATE = 280;
 const PROVIDER_BALANCE_EPSILON = 0.0001;
+const FINANCIAL_STATS_RESET_DATE = String(process.env.FINANCIAL_STATS_RESET_DATE || '2026-05-26').trim() || '2026-05-26';
 const PROVIDER_RECONCILIATION_INTERVAL_MS = Math.max(60000, Number(process.env.PROVIDER_RECONCILIATION_INTERVAL_MS || 180000));
 const SECURITY_MAX_CANCELLATIONS_PER_HOUR = Math.max(1, Number(process.env.SECURITY_MAX_CANCELLATIONS_PER_HOUR || 4));
 const SECURITY_MAX_REFUNDS_PER_DAY = Math.max(1, Number(process.env.SECURITY_MAX_REFUNDS_PER_DAY || 8));
@@ -490,6 +491,53 @@ function getOrderRiskEventTimestamp(order) {
 
 function getConfirmedProviderLossAmount(order) {
     return roundMoney(Math.max(0, -getRealProfitLossAmount(order)));
+}
+
+function getFinancialStatsResetAt() {
+    const candidate = new Date(`${FINANCIAL_STATS_RESET_DATE}T00:00:00`);
+    if (Number.isNaN(candidate.getTime())) {
+        return new Date('2026-05-26T00:00:00').toISOString();
+    }
+    return candidate.toISOString();
+}
+
+function getOrderFinancialTimelineTimestamp(order) {
+    return toIsoTimestamp(
+        order?.completed_at
+            || order?.sms_received_at
+            || order?.provider_status_synced_at
+            || order?.created_at,
+        toIsoTimestamp(order?.created_at, new Date().toISOString())
+    );
+}
+
+function isFinanciallySuccessfulOrder(order) {
+    const normalizedStatus = normalizeOrderStatus(order);
+    return normalizedStatus === 'completed'
+        || Boolean(order?.sms_received)
+        || hasStoredOtp(order);
+}
+
+function getFinancialRevenueAmount(order) {
+    return isFinanciallySuccessfulOrder(order)
+        ? roundMoney(order?.price != null ? order.price : order?.website_charge || 0)
+        : 0;
+}
+
+function getFinancialApiCostAmount(order) {
+    if (!isFinanciallySuccessfulOrder(order)) return 0;
+    const realProviderCost = getRealProviderCostAmount(order);
+    return realProviderCost > PROVIDER_BALANCE_EPSILON ? roundMoney(realProviderCost) : 0;
+}
+
+function getFinancialProfitAmount(order) {
+    return roundMoney(getFinancialRevenueAmount(order) - getFinancialApiCostAmount(order));
+}
+
+function isOrderAfterFinancialStatsReset(order) {
+    const resetAtMs = Date.parse(getFinancialStatsResetAt());
+    const financialAtMs = Date.parse(getOrderFinancialTimelineTimestamp(order));
+    return Number.isFinite(financialAtMs) && (!Number.isFinite(resetAtMs) || financialAtMs >= resetAtMs);
 }
 
 function isNormalResolvedRefund(order) {
@@ -3418,11 +3466,14 @@ async function getAllOrders() {
             COALESCE(u.email, o.user_email) AS user_email,
             COALESCE(u.balance, 0) AS client_balance_left,
             CASE
-                WHEN o.real_profit_loss IS NOT NULL
-                    THEN ROUND(COALESCE(o.real_profit_loss, 0)::numeric, 2)
-                WHEN COALESCE(o.provider_cost_pkr, 0) > 0
-                    THEN ROUND((COALESCE(o.price, 0) - COALESCE(o.provider_cost_pkr, 0))::numeric, 2)
-                ELSE ROUND((COALESCE(o.price, 0) - COALESCE(o.website_refund, 0))::numeric, 2)
+                WHEN (
+                    COALESCE(o.otp_received, FALSE) = TRUE
+                    OR COALESCE(o.sms_received, FALSE) = TRUE
+                    OR NULLIF(TRIM(COALESCE(o.otp_code, '')), '') IS NOT NULL
+                    OR COALESCE(o.status, o.order_status, 'pending') = 'completed'
+                )
+                    THEN ROUND((COALESCE(o.price, 0) - GREATEST(COALESCE(o.real_provider_cost, 0), 0))::numeric, 2)
+                ELSE 0::numeric
             END AS profit_pkr
         FROM orders o
         LEFT JOIN users u ON u.id = o.user_id
@@ -3480,7 +3531,8 @@ async function getAdminProviderAnalytics(options = {}) {
     const topRiskUserLimit = Math.max(5, Math.min(50, Number(options.topRiskUserLimit || 15)));
     const blockedUserLimit = Math.max(5, Math.min(50, Number(options.blockedUserLimit || 20)));
     const dailyEarningsLimit = Math.max(7, Math.min(60, Number(options.dailyEarningsLimit || 14)));
-    const [orders, userRows, latestSnapshotRow, recentSnapshotRows, providerBalanceSummaryRow, providerBalanceDailyRows, depositSummaryRow, anomalyEventRows] = await Promise.all([
+    const financialStatsResetAt = getFinancialStatsResetAt();
+    const [orders, userRows, latestSnapshotRow, recentSnapshotRows, providerBalanceSummaryRow, depositSummaryRow, anomalyEventRows] = await Promise.all([
         getAllOrders(),
         queryAll(`
             SELECT
@@ -3511,10 +3563,12 @@ async function getAdminProviderAnalytics(options = {}) {
         queryOne(`
             SELECT
                 COALESCE(SUM(GREATEST(delta_pkr, 0)) FILTER (
-                    WHERE reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                    WHERE created_at >= $1
+                      AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
                 ), 0)::numeric AS total_api_cost,
                 COALESCE(SUM(delta_pkr) FILTER (
-                    WHERE reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
+                    WHERE created_at >= $1
+                      AND reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
                 ), 0)::numeric AS total_provider_balance_change,
                 COALESCE(SUM(GREATEST(delta_pkr, 0)) FILTER (
                     WHERE created_at >= CURRENT_DATE
@@ -3542,23 +3596,13 @@ async function getAdminProviderAnalytics(options = {}) {
                       AND anomaly_flag = TRUE
                 )::int AS today_anomaly_count
             FROM provider_balance_snapshots
-        `),
-        queryAll(`
-            SELECT
-                TO_CHAR(DATE_TRUNC('day', created_at), 'YYYY-MM-DD') AS date_key,
-                COALESCE(SUM(GREATEST(delta_pkr, 0)), 0)::numeric AS api_cost,
-                COALESCE(SUM(delta_pkr), 0)::numeric AS provider_balance_change
-            FROM provider_balance_snapshots
-            WHERE reason NOT IN ('startup_reconciliation', 'scheduled_reconciliation')
-            GROUP BY 1
-            ORDER BY 1 DESC
-            LIMIT $1
-        `, [dailyEarningsLimit]),
+        `, [financialStatsResetAt]),
         queryOne(`
             SELECT
                 COALESCE(SUM(amount) FILTER (
                     WHERE LOWER(COALESCE(type, '')) = 'deposit'
                       AND LOWER(COALESCE(status, '')) = 'approved'
+                      AND created_at >= $1
                 ), 0)::numeric AS total_deposits,
                 COALESCE(SUM(amount) FILTER (
                     WHERE LOWER(COALESCE(type, '')) = 'deposit'
@@ -3567,7 +3611,7 @@ async function getAdminProviderAnalytics(options = {}) {
                       AND created_at < CURRENT_DATE + INTERVAL '1 day'
                 ), 0)::numeric AS today_deposits
             FROM transactions
-        `),
+        `, [financialStatsResetAt]),
         queryAll(`
             SELECT *
             FROM provider_security_events
@@ -3590,6 +3634,7 @@ async function getAdminProviderAnalytics(options = {}) {
         todayAnomalyCount: Number(providerBalanceSummaryRow?.today_anomaly_count || 0)
     };
     const todayKey = getAdminAnalyticsDateKey(new Date());
+    const financialResetDate = FINANCIAL_STATS_RESET_DATE;
     const userLookup = new Map(users.map((user) => [String(user.id), user]));
     const ordersByUser = new Map();
     const serviceBreakdownMap = new Map();
@@ -3606,6 +3651,7 @@ async function getAdminProviderAnalytics(options = {}) {
     let totalWebsiteProfit = 0;
     let totalRealProviderCost = 0;
     let totalRevenue = 0;
+    let financiallyCompletedOrders = 0;
 
     const ensureDailyEntry = (dateKey) => {
         if (!dateKey) return null;
@@ -3615,10 +3661,7 @@ async function getAdminProviderAnalytics(options = {}) {
                 revenue: 0,
                 apiCost: 0,
                 profitLoss: 0,
-                refunds: 0,
-                completedOrders: 0,
-                cancelledOrders: 0,
-                providerBalanceChange: 0
+                completedOrders: 0
             });
         }
         return dailyEarningsMap.get(dateKey);
@@ -3631,12 +3674,43 @@ async function getAdminProviderAnalytics(options = {}) {
         const websiteProfit = roundMoney(websiteCharge - websiteRefund);
         const realProviderCost = getRealProviderCostAmount(order);
         const realProfitLoss = getRealProfitLossAmount(order);
-        const lifecycleStatus = normalizeOrderStatus(order);
+        const withinFinancialResetWindow = isOrderAfterFinancialStatsReset(order);
+        const financiallySuccessfulOrder = isFinanciallySuccessfulOrder(order);
+        const financialTimestamp = getOrderFinancialTimelineTimestamp(order);
+        const financialRevenue = getFinancialRevenueAmount(order);
+        const financialApiCost = getFinancialApiCostAmount(order);
+        const financialProfit = getFinancialProfitAmount(order);
         const serviceKey = String(order?.provider_service || order?.service_type || 'unknown').trim() || 'unknown';
         const userIdKey = order?.user_id == null ? null : String(order.user_id);
-        totalOrders += 1;
-        if (order?.provider_used) {
-            providerUsedOrders += 1;
+        if (withinFinancialResetWindow) {
+            totalOrders += 1;
+            if (financiallySuccessfulOrder) {
+                providerUsedOrders += 1;
+                financiallyCompletedOrders += 1;
+                totalWebsiteCharge += financialRevenue;
+                totalWebsiteProfit += financialProfit;
+                totalRealProviderCost += financialApiCost;
+                totalRevenue += financialRevenue;
+                const dailyEntry = ensureDailyEntry(getAdminAnalyticsDateKey(financialTimestamp));
+                if (dailyEntry) {
+                    dailyEntry.revenue += financialRevenue;
+                    dailyEntry.apiCost += financialApiCost;
+                    dailyEntry.completedOrders += 1;
+                }
+                if (!serviceBreakdownMap.has(serviceKey)) {
+                    serviceBreakdownMap.set(serviceKey, {
+                        provider_service: serviceKey,
+                        total_orders: 0,
+                        risk_orders: 0,
+                        total_real_provider_cost: 0,
+                        total_real_profit_loss: 0
+                    });
+                }
+                const serviceEntry = serviceBreakdownMap.get(serviceKey);
+                serviceEntry.total_orders += 1;
+                serviceEntry.total_real_provider_cost += financialApiCost;
+                serviceEntry.total_real_profit_loss += financialProfit;
+            }
         }
         if (order?.riskState?.riskFlag) {
             riskOrders += 1;
@@ -3650,59 +3724,12 @@ async function getAdminProviderAnalytics(options = {}) {
         if (websiteRefund > 0) {
             refundedOrders += 1;
         }
-        totalWebsiteCharge += websiteCharge;
-        totalWebsiteRefund += websiteRefund;
-        totalWebsiteProfit += websiteProfit;
-        totalRealProviderCost += realProviderCost;
-
-        if (!serviceBreakdownMap.has(serviceKey)) {
-            serviceBreakdownMap.set(serviceKey, {
-                provider_service: serviceKey,
-                total_orders: 0,
-                risk_orders: 0,
-                total_real_provider_cost: 0,
-                total_real_profit_loss: 0
-            });
-        }
-        const serviceEntry = serviceBreakdownMap.get(serviceKey);
-        serviceEntry.total_orders += 1;
-        serviceEntry.total_real_provider_cost += realProviderCost;
-        serviceEntry.total_real_profit_loss += realProfitLoss;
-        if (order?.riskState?.riskFlag) {
-            serviceEntry.risk_orders += 1;
-        }
 
         if (userIdKey) {
             if (!ordersByUser.has(userIdKey)) {
                 ordersByUser.set(userIdKey, []);
             }
             ordersByUser.get(userIdKey).push(order);
-        }
-
-        if (lifecycleStatus === 'completed') {
-            const completedKey = getAdminAnalyticsDateKey(order?.completed_at || order?.provider_status_synced_at || order?.created_at);
-            const completedEntry = ensureDailyEntry(completedKey);
-            if (completedEntry) {
-                completedEntry.revenue += websiteCharge;
-                completedEntry.completedOrders += 1;
-            }
-            totalRevenue += websiteCharge;
-        }
-
-        if (websiteRefund > 0) {
-            const refundKey = getAdminAnalyticsDateKey(order?.refunded_at || order?.provider_status_synced_at || order?.created_at);
-            const refundEntry = ensureDailyEntry(refundKey);
-            if (refundEntry) {
-                refundEntry.refunds += websiteRefund;
-            }
-        }
-
-        if (lifecycleStatus === 'cancelled') {
-            const cancelledKey = getAdminAnalyticsDateKey(order?.provider_status_synced_at || order?.refunded_at || order?.created_at);
-            const cancelledEntry = ensureDailyEntry(cancelledKey);
-            if (cancelledEntry) {
-                cancelledEntry.cancelledOrders += 1;
-            }
         }
 
         if (order?.riskState?.lossDetected) {
@@ -3732,21 +3759,12 @@ async function getAdminProviderAnalytics(options = {}) {
         }
     }
 
-    for (const row of providerBalanceDailyRows) {
-        const entry = ensureDailyEntry(String(row.date_key || '').trim() || null);
-        if (!entry) continue;
-        entry.apiCost += Number(row.api_cost || 0);
-        entry.providerBalanceChange += Number(row.provider_balance_change || 0);
-    }
-
     const dailyEarnings = Array.from(dailyEarningsMap.values())
         .map((entry) => ({
             ...entry,
             revenue: roundMoney(entry.revenue),
             apiCost: roundMoney(entry.apiCost),
-            profitLoss: roundMoney(entry.revenue - entry.apiCost),
-            refunds: roundMoney(entry.refunds),
-            providerBalanceChange: roundMoney(entry.providerBalanceChange)
+            profitLoss: roundMoney(entry.revenue - entry.apiCost)
         }))
         .sort((left, right) => String(right.date).localeCompare(String(left.date)))
         .slice(0, dailyEarningsLimit);
@@ -3756,10 +3774,7 @@ async function getAdminProviderAnalytics(options = {}) {
         revenue: 0,
         apiCost: 0,
         profitLoss: 0,
-        refunds: 0,
-        completedOrders: 0,
-        cancelledOrders: 0,
-        providerBalanceChange: 0
+        completedOrders: 0
     };
 
     const enrichedUsers = users.map((user) => {
@@ -3792,15 +3807,14 @@ async function getAdminProviderAnalytics(options = {}) {
         todayRevenue: roundMoney(todayEntry.revenue || 0),
         totalIncome: roundMoney(totalRevenue),
         todayIncome: roundMoney(todayEntry.revenue || 0),
-        totalApiCost: roundMoney(providerBalanceSummary.totalApiCost || 0),
-        todayApiCost: roundMoney(providerBalanceSummary.todayApiCost || 0),
-        totalProfit: roundMoney(totalRevenue - Number(providerBalanceSummary.totalApiCost || 0)),
-        todayProfit: roundMoney((todayEntry.revenue || 0) - Number(providerBalanceSummary.todayApiCost || 0)),
-        todayRefunds: roundMoney(todayEntry.refunds || 0),
+        totalApiCost: roundMoney(totalRealProviderCost),
+        todayApiCost: roundMoney(todayEntry.apiCost || 0),
+        totalProfit: roundMoney(totalRevenue - totalRealProviderCost),
+        todayProfit: roundMoney((todayEntry.revenue || 0) - (todayEntry.apiCost || 0)),
         todayCompletedOrders: Number(todayEntry.completedOrders || 0),
-        todayCancelledOrders: Number(todayEntry.cancelledOrders || 0),
         todayProviderBalanceChange: roundMoney(providerBalanceSummary.todayProviderBalanceChange || 0),
-        totalProviderBalanceChange: roundMoney(providerBalanceSummary.totalProviderBalanceChange || 0)
+        totalProviderBalanceChange: roundMoney(providerBalanceSummary.totalProviderBalanceChange || 0),
+        financialResetDate
     };
 
     const summary = {
@@ -3834,10 +3848,12 @@ async function getAdminProviderAnalytics(options = {}) {
         latestAnomalyFlag: Boolean(normalizedLatestSnapshot?.anomaly_flag),
         todayRevenue: financeSummary.todayRevenue,
         todayProfit: financeSummary.todayProfit,
-        todayRefunds: financeSummary.todayRefunds,
         todayCompletedOrders: financeSummary.todayCompletedOrders,
-        todayCancelledOrders: financeSummary.todayCancelledOrders,
-        todayProviderBalanceChange: financeSummary.todayProviderBalanceChange
+        todayProviderBalanceChange: financeSummary.todayProviderBalanceChange,
+        financiallyCompletedOrders,
+        financialResetDate,
+        totalRevenue: financeSummary.totalRevenue,
+        totalProfit: financeSummary.totalProfit
     };
 
     const serviceBreakdown = Array.from(serviceBreakdownMap.values())
