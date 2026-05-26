@@ -2179,6 +2179,12 @@ function hasOrderOtp(order) {
     return Boolean(String(order?.otp_code || '').trim() || order?.otp_received);
 }
 
+function isFinanciallySuccessfulAdminOrder(order) {
+    return getOrderLifecycleStatus(order) === 'completed'
+        || Boolean(order?.sms_received)
+        || hasOrderOtp(order);
+}
+
 function getOrderRawStatus(order) {
     return String(order?.status || order?.order_status || '').trim().toLowerCase();
 }
@@ -3269,26 +3275,28 @@ function renderActiveOrders(orders) {
 }
 
 function getOrderApiCost(order) {
+    if (!isFinanciallySuccessfulAdminOrder(order)) {
+        return 0;
+    }
     if (order?.real_provider_cost != null && Number.isFinite(Number(order.real_provider_cost))) {
-        return Number(order.real_provider_cost || 0);
+        return Math.max(0, Number(order.real_provider_cost || 0));
     }
     if (order?.provider_cost_pkr != null && Number.isFinite(Number(order.provider_cost_pkr))) {
-        return Number(order.provider_cost_pkr || 0);
+        return Math.max(0, Number(order.provider_cost_pkr || 0));
     }
     return 0;
 }
 
 function getOrderProfit(order) {
-    const websiteCharge = Number(order?.website_charge ?? order?.price ?? 0);
-    const websiteRefund = Number(order?.website_refund ?? 0);
-    const providerCost = getOrderApiCost(order);
-    if (order?.real_profit_loss != null && Number.isFinite(Number(order.real_profit_loss))) {
-        return Number(order.real_profit_loss || 0);
+    if (!isFinanciallySuccessfulAdminOrder(order)) {
+        return 0;
     }
+    const websiteCharge = Number(order?.price ?? order?.website_charge ?? 0);
+    const providerCost = getOrderApiCost(order);
     if (order?.profit_pkr != null && Number.isFinite(Number(order.profit_pkr))) {
         return Number(order.profit_pkr || 0);
     }
-    return websiteCharge - websiteRefund - providerCost;
+    return websiteCharge - providerCost;
 }
 
 function getOrderFinancialTimestamp(order) {
@@ -3374,6 +3382,7 @@ function renderAdminDailyProfitDetails(entries, summary) {
     const container = qs('admin-daily-profit-details');
     if (!container) return;
     const todayKey = getFinancialDateKey(new Date());
+    const totalProfitLabel = summary?.financialResetDate ? `Since ${summary.financialResetDate} Profit` : 'Since Reset Profit';
     const summaryMarkup = `
         <div class="grid gap-3 lg:grid-cols-4">
             <div class="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
@@ -3389,7 +3398,7 @@ function renderAdminDailyProfitDetails(entries, summary) {
                 <div class="mt-2 text-2xl font-extrabold text-amber-700">${escapeHtml(formatMoneyPrecise(summary?.todayApiCost || 0))}</div>
             </div>
             <div class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Overall Profit</div>
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">${escapeHtml(totalProfitLabel)}</div>
                 <div class="mt-2 text-2xl font-extrabold text-slate-900">${escapeHtml(formatMoneyPrecise(summary?.totalProfit || 0))}</div>
             </div>
         </div>
@@ -3411,13 +3420,10 @@ function renderAdminDailyProfitDetails(entries, summary) {
                 <td class="px-4 py-3 whitespace-nowrap font-semibold text-cyan-700">${escapeHtml(formatMoneyPrecise(entry.revenue || 0))}</td>
                 <td class="px-4 py-3 whitespace-nowrap font-semibold text-amber-700">${escapeHtml(formatMoneyPrecise(entry.apiCost || 0))}</td>
                 <td class="px-4 py-3 whitespace-nowrap font-semibold ${(Number(entry.profitLoss || 0) >= 0) ? 'text-emerald-700' : 'text-rose-700'}">${escapeHtml(formatMoneyPrecise(entry.profitLoss || 0))}</td>
-                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(entry.refunds || 0))}</td>
-                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.completedOrders || 0))}</td>
-                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.cancelledOrders || 0))}</td>
             </tr>
         `;
     }).join('');
-    container.innerHTML = `${summaryMarkup}<div class="mt-4">${renderAdminTable(['Date', 'Revenue', 'API Cost', 'Profit', 'Refunds', 'Completed', 'Cancelled'], rows, 'min-w-[1080px]')}</div>`;
+    container.innerHTML = `${summaryMarkup}<div class="mt-4">${renderAdminTable(['Date', 'Revenue', 'API Cost', 'Profit'], rows, 'min-w-[820px]')}</div>`;
 }
 
 function renderAdminUserSpending(spending, users) {
@@ -3485,19 +3491,19 @@ function renderAdminProviderSummary(summary) {
         {
             title: 'Real Provider Cost',
             value: formatMoneyPrecise(summary?.totalRealProviderCost || 0),
-            detail: `${Number(summary?.providerUsedOrders || 0)} provider-used orders`,
+            detail: `${Number(summary?.financiallyCompletedOrders || 0)} completed OTP orders`,
             tone: 'border-amber-200 bg-amber-50 text-amber-700'
         },
         {
             title: 'Today API Cost',
             value: formatMoneyPrecise(summary?.todayApiCost || 0),
-            detail: `Provider deductions ${formatMoneyPrecise(summary?.todayProviderDeductions || 0)}`,
+            detail: 'Only billed completed OTP orders are counted',
             tone: 'border-cyan-200 bg-cyan-50 text-cyan-700'
         },
         {
-            title: 'Real Profit / Loss',
+            title: 'Real Profit',
             value: formatMoneyPrecise(summary?.totalRealProfitLoss || 0),
-            detail: `Today ${formatMoneyPrecise(summary?.todayRealProfitLoss || 0)} • ${Number(summary?.refundedOrders || 0)} refunded orders`,
+            detail: `Today ${formatMoneyPrecise(summary?.todayRealProfitLoss || 0)} • Revenue ${formatMoneyPrecise(summary?.totalRevenue || 0)}`,
             tone: Number(summary?.totalRealProfitLoss || 0) >= 0
                 ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
                 : 'border-rose-200 bg-rose-50 text-rose-700'
@@ -3527,9 +3533,9 @@ function renderAdminProviderSummary(summary) {
             <div class="font-semibold text-slate-900">Latest reconciliation</div>
             <div class="mt-1">Reason: ${escapeHtml(summary?.latestReconciliationReason || '—')}</div>
             <div class="mt-1">Unmatched delta: <strong>${escapeHtml(formatMoneyPrecise(summary?.latestUnmatchedDeltaPkr || 0))}</strong></div>
-            <div class="mt-1">Website charge / refund: ${escapeHtml(formatMoneyPrecise(summary?.totalWebsiteCharge || 0))} / ${escapeHtml(formatMoneyPrecise(summary?.totalWebsiteRefund || 0))}</div>
-            <div class="mt-1">Today expected provider spend / actual deductions: ${escapeHtml(formatMoneyPrecise(summary?.todayExpectedProviderSpend || 0))} / ${escapeHtml(formatMoneyPrecise(summary?.todayProviderDeductions || 0))}</div>
-            <div class="mt-1 ${summary?.todayLossWarning ? 'font-semibold text-rose-700' : 'text-slate-600'}">${escapeHtml(summary?.todayLossWarning ? 'Warning: provider losses are higher than expected today.' : 'No excess provider-loss warning detected for today.')}</div>
+            <div class="mt-1">Financial reset date: ${escapeHtml(summary?.financialResetDate || '—')}</div>
+            <div class="mt-1">Revenue / API cost / profit: ${escapeHtml(formatMoneyPrecise(summary?.totalRevenue || 0))} / ${escapeHtml(formatMoneyPrecise(summary?.totalRealProviderCost || 0))} / ${escapeHtml(formatMoneyPrecise(summary?.totalRealProfitLoss || 0))}</div>
+            <div class="mt-1 ${summary?.todayLossWarning ? 'font-semibold text-rose-700' : 'text-slate-600'}">${escapeHtml(summary?.todayLossWarning ? 'Warning: provider deductions are higher than expected today.' : 'No unusual provider deduction warning detected for today.')}</div>
         </div>
     `;
     setElementHtmlIfChanged(container, `${headerMarkup}${reconciliationNote}`);
@@ -3652,6 +3658,7 @@ function renderAdminProviderDailyEarnings(entries, summary) {
     const container = qs('admin-provider-daily-earnings');
     if (!container) return;
     const todayKey = getFinancialDateKey(new Date());
+    const totalProfitLabel = summary?.financialResetDate ? `Since ${summary.financialResetDate} Profit` : 'Since Reset Profit';
     const headerMarkup = `
         <div class="grid gap-3 lg:grid-cols-4">
             <div class="rounded-2xl border border-cyan-200 bg-cyan-50 p-4">
@@ -3667,8 +3674,8 @@ function renderAdminProviderDailyEarnings(entries, summary) {
                 <div class="mt-2 text-2xl font-extrabold text-emerald-700">${escapeHtml(formatMoneyPrecise(summary?.todayProfit || 0))}</div>
             </div>
             <div class="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Today Refunds</div>
-                <div class="mt-2 text-2xl font-extrabold text-slate-900">${escapeHtml(formatMoneyPrecise(summary?.todayRefunds || 0))}</div>
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">${escapeHtml(totalProfitLabel)}</div>
+                <div class="mt-2 text-2xl font-extrabold text-slate-900">${escapeHtml(formatMoneyPrecise(summary?.totalProfit || 0))}</div>
             </div>
         </div>
     `;
@@ -3689,36 +3696,34 @@ function renderAdminProviderDailyEarnings(entries, summary) {
                 <td class="px-4 py-3 whitespace-nowrap font-semibold text-cyan-700">${escapeHtml(formatMoneyPrecise(entry.revenue || 0))}</td>
                 <td class="px-4 py-3 whitespace-nowrap font-semibold text-amber-700">${escapeHtml(formatMoneyPrecise(entry.apiCost || 0))}</td>
                 <td class="px-4 py-3 whitespace-nowrap font-semibold ${(Number(entry.profitLoss || 0) >= 0) ? 'text-emerald-700' : 'text-rose-700'}">${escapeHtml(formatMoneyPrecise(entry.profitLoss || 0))}</td>
-                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(formatMoneyPrecise(entry.refunds || 0))}</td>
-                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.completedOrders || 0))}</td>
-                <td class="px-4 py-3 whitespace-nowrap text-slate-600">${escapeHtml(String(entry.cancelledOrders || 0))}</td>
             </tr>
         `;
     }).join('');
-    container.innerHTML = `${headerMarkup}<div class="mt-4">${renderAdminTable(['Date', 'Revenue', 'API Cost', 'Profit', 'Refunds', 'Completed', 'Cancelled'], rows, 'min-w-[1080px]')}</div>`;
+    container.innerHTML = `${headerMarkup}<div class="mt-4">${renderAdminTable(['Date', 'Revenue', 'API Cost', 'Profit'], rows, 'min-w-[820px]')}</div>`;
 }
 
 function renderAdminStats(stats) {
     const container = qs('admin-stats-list');
     if (!container) return;
+    const totalScopeLabel = stats?.financialResetDate ? `Since ${stats.financialResetDate}` : 'Since Reset';
     const rows = `
         <tr class="border-b border-slate-200 align-top last:border-b-0">
-            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">Overall</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(totalScopeLabel)}</td>
             <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.totalDeposits))}</td>
-            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.totalIncome))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.totalRevenue ?? stats.totalIncome ?? 0))}</td>
             <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.totalApiCost))}</td>
             <td class="px-4 py-3 whitespace-nowrap font-semibold text-emerald-700">${escapeHtml(formatMoneyPrecise(stats.totalProfit))}</td>
         </tr>
         <tr class="border-b border-slate-200 align-top last:border-b-0">
             <td class="px-4 py-3 whitespace-nowrap font-semibold text-emerald-700">Today</td>
             <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.todayDeposits))}</td>
-            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.todayIncome))}</td>
+            <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.todayRevenue ?? stats.todayIncome ?? 0))}</td>
             <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(stats.todayApiCost))}</td>
             <td class="px-4 py-3 whitespace-nowrap font-semibold text-emerald-700">${escapeHtml(formatMoneyPrecise(stats.todayProfit))}</td>
         </tr>
     `;
     container.innerHTML = renderAdminTable(
-        ['Scope', 'Deposits', 'Income', 'API Cost', 'Real Profit'],
+        ['Scope', 'Deposits', 'Revenue', 'API Cost', 'Real Profit'],
         rows,
         'min-w-[980px]'
     );
