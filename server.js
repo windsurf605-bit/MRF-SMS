@@ -13,6 +13,118 @@ try {
     console.error("❌ connect-pg-simple not loaded:", err.message);
 }
 
+async function createPaymentRequestSubmission(req) {
+    const requestedPaymentMethod = String(req.body.payment_method || '').trim().toLowerCase();
+    if (requestedPaymentMethod && !['easypaisa', 'binance'].includes(requestedPaymentMethod)) {
+        throw new Error('Unsupported payment method');
+    }
+    const methodConfig = getPaymentMethodConfig(requestedPaymentMethod);
+    const amount = roundMoney(Number.parseFloat(req.body.amount));
+    if (!Number.isFinite(amount) || amount < methodConfig.minimumAmount) {
+        throw new Error(methodConfig.paymentMethod === 'binance'
+            ? `Minimum Binance deposit is ${BINANCE_MIN_DEPOSIT_USDT} USDT`
+            : `Minimum amount ${EASYPAISA_MIN_DEPOSIT_PKR} PKR`);
+    }
+    if (paymentRateLimiter[req.session.userId] && Date.now() - paymentRateLimiter[req.session.userId] < 60000) {
+        throw new Error('Please wait 1 minute between requests');
+    }
+    const user = await findUserById(req.session.userId);
+    if (!user) {
+        throw new Error('User not found');
+    }
+    const transactionId = normalizePaymentReference(req.body.transaction_id);
+    const screenshot = req.file ? req.file.filename : null;
+    if (!screenshot) {
+        throw new Error('Payment screenshot is required');
+    }
+    if (!(await isValidUploadedPaymentProof(screenshot))) {
+        throw new Error('Invalid payment proof file');
+    }
+    if (methodConfig.requiresTransactionId && !transactionId) {
+        throw new Error(`${methodConfig.transactionLabel} is required`);
+    }
+    const proofHash = await hashUploadedFile(screenshot);
+    if (proofHash) {
+        const duplicateProof = await queryOne('SELECT id FROM payment_requests WHERE proof_hash = $1 LIMIT 1', [proofHash]);
+        if (duplicateProof) {
+            throw new Error('This payment proof has already been submitted');
+        }
+    }
+    const deviceFingerprint = normalizeDeviceFingerprint(req.body.deviceFingerprint);
+    const browserFingerprint = normalizeBrowserFingerprint(req.body.browserFingerprint);
+    const note = String(req.body.note || '').trim().slice(0, 500) || null;
+    const creditedAmount = roundMoney(methodConfig.creditedAmountCalculator(amount));
+    await queryRun(
+        `
+            INSERT INTO payment_requests (
+                user_id,
+                user_email,
+                user_name_snapshot,
+                payment_method,
+                amount,
+                amount_currency,
+                credit_amount,
+                transaction_id,
+                screenshot,
+                note,
+                status,
+                request_ip,
+                device_fingerprint,
+                browser_fingerprint,
+                proof_hash
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        `,
+        [
+            req.session.userId,
+            user.email,
+            String(user.name || user.email || '').trim() || null,
+            methodConfig.paymentMethod,
+            amount,
+            methodConfig.amountCurrency,
+            creditedAmount,
+            transactionId || null,
+            screenshot,
+            note,
+            'pending',
+            getRequestClientIp(req) || null,
+            deviceFingerprint || null,
+            browserFingerprint || null,
+            proofHash || null
+        ]
+    );
+    paymentRateLimiter[req.session.userId] = Date.now();
+    return {
+        success: true,
+        paymentMethod: methodConfig.paymentMethod,
+        amount,
+        amountCurrency: methodConfig.amountCurrency,
+        creditAmount: creditedAmount,
+        paymentLabel: getPaymentRequestAmountSummary({
+            payment_method: methodConfig.paymentMethod,
+            amount,
+            amount_currency: methodConfig.amountCurrency,
+            credit_amount: creditedAmount
+        })
+    };
+}
+
+async function handlePaymentRequestSubmission(req, res) {
+    const uploadedScreenshot = req.file ? req.file.filename : null;
+    try {
+        const result = await createPaymentRequestSubmission(req);
+        res.json(result);
+    } catch (err) {
+        if (uploadedScreenshot) {
+            await removeUploadedFile(uploadedScreenshot);
+        }
+        if (err && err.code === '23505') {
+            return res.status(400).send('This transaction ID has already been submitted');
+        }
+        res.status(400).send(formatSafeError(err));
+    }
+}
+
 // Nodemailer (SAFE)
 let nodemailer = null;
 
@@ -66,7 +178,45 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR || '/app/uploads';
 if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
-const upload = multer({ dest: UPLOAD_DIR });
+const PAYMENT_PROOF_ALLOWED_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const PAYMENT_PROOF_ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const EASYPAISA_MIN_DEPOSIT_PKR = 100;
+const BINANCE_MIN_DEPOSIT_USDT = 1;
+const BINANCE_UID = '1049681083';
+const BINANCE_ACCOUNT_NAME = 'M3_Faisal_Bro';
+const paymentProofStorage = multer.diskStorage({
+    destination: (_req, _file, callback) => callback(null, UPLOAD_DIR),
+    filename: (_req, file, callback) => {
+        const originalExtension = path.extname(String(file?.originalname || '').toLowerCase());
+        const safeExtension = PAYMENT_PROOF_ALLOWED_EXTENSIONS.has(originalExtension) ? originalExtension : '.jpg';
+        callback(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${safeExtension}`);
+    }
+});
+const upload = multer({
+    storage: paymentProofStorage,
+    limits: {
+        fileSize: 5 * 1024 * 1024
+    },
+    fileFilter: (_req, file, callback) => {
+        const originalExtension = path.extname(String(file?.originalname || '').toLowerCase());
+        const mimeType = String(file?.mimetype || '').toLowerCase();
+        if (!PAYMENT_PROOF_ALLOWED_EXTENSIONS.has(originalExtension) || !PAYMENT_PROOF_ALLOWED_MIME_TYPES.has(mimeType)) {
+            return callback(new Error('Only JPG, JPEG, PNG, and WEBP payment proofs are allowed'));
+        }
+        callback(null, true);
+    }
+});
+function paymentProofUpload(req, res, next) {
+    upload.single('screenshot')(req, res, (err) => {
+        if (!err) {
+            return next();
+        }
+        if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+            return res.status(400).send('Payment proof must be 5 MB or smaller');
+        }
+        return res.status(400).send(formatSafeError(err, 'Payment proof upload failed'));
+    });
+}
 
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 if (!DATABASE_URL) {
@@ -838,6 +988,11 @@ function normalizePaymentRequest(row) {
     return {
         ...row,
         amount: Number(row.amount || 0),
+        credit_amount: Number(row.credit_amount || 0),
+        payment_method: normalizePaymentMethod(row.payment_method),
+        amount_currency: String(row.amount_currency || 'PKR').trim().toUpperCase() || 'PKR',
+        note: String(row.note || '').trim() || null,
+        user_name_snapshot: String(row.user_name_snapshot || '').trim() || '',
         user_name: row.user_name || '',
         user_email: row.user_email || ''
     };
@@ -984,6 +1139,54 @@ function normalizePaymentReference(value) {
     return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 128);
 }
 
+function normalizePaymentMethod(value) {
+    const normalizedValue = String(value || '').trim().toLowerCase();
+    return normalizedValue === 'binance' ? 'binance' : 'easypaisa';
+}
+
+function getPaymentMethodConfig(paymentMethod) {
+    const normalizedMethod = normalizePaymentMethod(paymentMethod);
+    if (normalizedMethod === 'binance') {
+        return {
+            paymentMethod: 'binance',
+            amountCurrency: 'USDT',
+            minimumAmount: BINANCE_MIN_DEPOSIT_USDT,
+            creditedAmountLabel: 'PKR wallet credit',
+            creditedAmountCalculator: (amount) => usdToPkr(amount),
+            transactionLabel: 'Binance transaction ID',
+            requiresTransactionId: true
+        };
+    }
+    return {
+        paymentMethod: 'easypaisa',
+        amountCurrency: 'PKR',
+        minimumAmount: EASYPAISA_MIN_DEPOSIT_PKR,
+        creditedAmountLabel: 'PKR wallet credit',
+        creditedAmountCalculator: (amount) => roundMoney(amount),
+        transactionLabel: 'Transaction ID',
+        requiresTransactionId: false
+    };
+}
+
+function getPaymentRequestCreditAmount(paymentRequest) {
+    const methodConfig = getPaymentMethodConfig(paymentRequest?.payment_method);
+    const storedCreditAmount = Number(paymentRequest?.credit_amount || 0);
+    if (storedCreditAmount > 0) {
+        return roundMoney(storedCreditAmount);
+    }
+    return roundMoney(methodConfig.creditedAmountCalculator(Number(paymentRequest?.amount || 0)));
+}
+
+function getPaymentRequestAmountSummary(paymentRequest) {
+    const methodConfig = getPaymentMethodConfig(paymentRequest?.payment_method);
+    const amount = roundMoney(Number(paymentRequest?.amount || 0));
+    const creditedAmount = getPaymentRequestCreditAmount(paymentRequest);
+    if (methodConfig.amountCurrency === 'USDT') {
+        return `${amount} USDT (credits ${creditedAmount} PKR)`;
+    }
+    return `${amount} PKR`;
+}
+
 function buildPublicAppBaseUrl(req) {
     if (APP_BASE_URL) {
         return APP_BASE_URL;
@@ -1013,6 +1216,28 @@ async function hashUploadedFile(fileName) {
         return crypto.createHash('sha256').update(fileBuffer).digest('hex');
     } catch {
         return null;
+    }
+}
+
+async function isValidUploadedPaymentProof(fileName) {
+    const normalizedName = path.basename(String(fileName || '').trim());
+    if (!normalizedName) return false;
+    const filePath = path.join(UPLOAD_DIR, normalizedName);
+    try {
+        const fileHandle = await fs.promises.open(filePath, 'r');
+        try {
+            const header = Buffer.alloc(16);
+            await fileHandle.read(header, 0, 16, 0);
+            const isJpeg = header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff;
+            const isPng = header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4e && header[3] === 0x47
+                && header[4] === 0x0d && header[5] === 0x0a && header[6] === 0x1a && header[7] === 0x0a;
+            const isWebp = header.toString('ascii', 0, 4) === 'RIFF' && header.toString('ascii', 8, 12) === 'WEBP';
+            return Boolean(isJpeg || isPng || isWebp);
+        } finally {
+            await fileHandle.close();
+        }
+    } catch {
+        return false;
     }
 }
 
@@ -1450,6 +1675,11 @@ async function initDB() {
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     `);
+    await queryRun("ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'easypaisa'");
+    await queryRun("ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS amount_currency TEXT DEFAULT 'PKR'");
+    await queryRun('ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS credit_amount NUMERIC(12,2) DEFAULT 0');
+    await queryRun('ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS note TEXT');
+    await queryRun('ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS user_name_snapshot TEXT');
     await queryRun('ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS request_ip TEXT');
     await queryRun('ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS device_fingerprint TEXT');
     await queryRun('ALTER TABLE payment_requests ADD COLUMN IF NOT EXISTS browser_fingerprint TEXT');
@@ -1953,7 +2183,7 @@ async function getAllPaymentRequests() {
     const rows = await queryAll(`
         SELECT
             pr.*,
-            COALESCE(u.name, '') AS user_name,
+            COALESCE(NULLIF(pr.user_name_snapshot, ''), u.name, '') AS user_name,
             COALESCE(u.email, pr.user_email) AS user_email
         FROM payment_requests pr
         LEFT JOIN users u ON u.id = pr.user_id
@@ -1966,7 +2196,7 @@ async function getPaymentHistoryByUser(userId) {
     const rows = await queryAll(`
         SELECT
             pr.*,
-            COALESCE(u.name, '') AS user_name,
+            COALESCE(NULLIF(pr.user_name_snapshot, ''), u.name, '') AS user_name,
             COALESCE(u.email, pr.user_email) AS user_email
         FROM payment_requests pr
         LEFT JOIN users u ON u.id = pr.user_id
@@ -11078,112 +11308,12 @@ app.post('/api/admin/transactions/:txId/cancel', ensureAdmin, async (req, res) =
     }
 });
 
-app.post('/api/request-payment', ensureAuth, upload.single('screenshot'), async (req, res) => {
-    try {
-        const amount = parseFloat(req.body.amount);
-        if (!amount || amount < 100) return res.status(400).send('Minimum amount 100 PKR');
-        if (paymentRateLimiter[req.session.userId] && Date.now() - paymentRateLimiter[req.session.userId] < 60000) {
-            return res.status(429).send('Please wait 1 minute between requests');
-        }
-        const user = await findUserById(req.session.userId);
-        if (!user) return res.status(401).send('User not found');
-        const transaction_id = normalizePaymentReference(req.body.transaction_id);
-        const screenshot = req.file ? req.file.filename : null;
-        const proofHash = screenshot ? await hashUploadedFile(screenshot) : null;
-        const deviceFingerprint = normalizeDeviceFingerprint(req.body.deviceFingerprint);
-        const browserFingerprint = normalizeBrowserFingerprint(req.body.browserFingerprint);
-        if (!screenshot && !transaction_id) return res.status(400).send('Screenshot or transaction ID is required');
-        await queryRun(
-            `
-                INSERT INTO payment_requests (
-                    user_id,
-                    user_email,
-                    amount,
-                    transaction_id,
-                    screenshot,
-                    status,
-                    request_ip,
-                    device_fingerprint,
-                    browser_fingerprint,
-                    proof_hash
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            `,
-            [
-                req.session.userId,
-                user.email,
-                amount,
-                transaction_id || null,
-                screenshot,
-                'pending',
-                getRequestClientIp(req) || null,
-                deviceFingerprint || null,
-                browserFingerprint || null,
-                proofHash || null
-            ]
-        );
-        paymentRateLimiter[req.session.userId] = Date.now();
-        res.json({ success: true });
-    } catch (err) {
-        if (err && err.code === '23505') {
-            return res.status(400).send('This transaction ID has already been submitted');
-        }
-        res.status(500).send(formatSafeError(err));
-    }
+app.post('/api/request-payment', ensureAuth, paymentProofUpload, async (req, res) => {
+    await handlePaymentRequestSubmission(req, res);
 });
 
-app.post('/api/add-funds', ensureAuth, upload.single('screenshot'), async (req, res) => {
-    try {
-        const amount = parseFloat(req.body.amount);
-        if (!amount || amount < 100) return res.status(400).send('Minimum amount 100 PKR');
-        if (paymentRateLimiter[req.session.userId] && Date.now() - paymentRateLimiter[req.session.userId] < 60000) {
-            return res.status(429).send('Please wait 1 minute between requests');
-        }
-        const user = await findUserById(req.session.userId);
-        if (!user) return res.status(401).send('User not found');
-        const transaction_id = normalizePaymentReference(req.body.transaction_id);
-        const screenshot = req.file ? req.file.filename : null;
-        const proofHash = screenshot ? await hashUploadedFile(screenshot) : null;
-        const deviceFingerprint = normalizeDeviceFingerprint(req.body.deviceFingerprint);
-        const browserFingerprint = normalizeBrowserFingerprint(req.body.browserFingerprint);
-        if (!screenshot && !transaction_id) return res.status(400).send('Screenshot or transaction ID is required');
-        await queryRun(
-            `
-                INSERT INTO payment_requests (
-                    user_id,
-                    user_email,
-                    amount,
-                    transaction_id,
-                    screenshot,
-                    status,
-                    request_ip,
-                    device_fingerprint,
-                    browser_fingerprint,
-                    proof_hash
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            `,
-            [
-                req.session.userId,
-                user.email,
-                amount,
-                transaction_id || null,
-                screenshot,
-                'pending',
-                getRequestClientIp(req) || null,
-                deviceFingerprint || null,
-                browserFingerprint || null,
-                proofHash || null
-            ]
-        );
-        paymentRateLimiter[req.session.userId] = Date.now();
-        res.json({ success: true });
-    } catch (err) {
-        if (err && err.code === '23505') {
-            return res.status(400).send('This transaction ID has already been submitted');
-        }
-        res.status(500).send(formatSafeError(err));
-    }
+app.post('/api/add-funds', ensureAuth, paymentProofUpload, async (req, res) => {
+    await handlePaymentRequestSubmission(req, res);
 });
 
 app.get('/api/admin/payment-requests', ensureAdmin, async (req, res) => {
@@ -11217,7 +11347,8 @@ app.post('/api/admin/payment-requests/:id/approve', ensureAdmin, async (req, res
         const userRes = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [paymentRequest.user_id]);
         const user = userRes.rows[0];
         if (!user) throw new Error('User not found');
-        await client.query('UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2', [Number(paymentRequest.amount || 0), paymentRequest.user_id]);
+        const creditedAmount = getPaymentRequestCreditAmount(paymentRequest);
+        await client.query('UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE id = $2', [creditedAmount, paymentRequest.user_id]);
         await client.query(
             `
                 INSERT INTO transactions (
@@ -11239,10 +11370,10 @@ app.post('/api/admin/payment-requests/:id/approve', ensureAdmin, async (req, res
             [
                 paymentRequest.user_id,
                 paymentRequest.user_email,
-                paymentRequest.amount,
+                creditedAmount,
                 'deposit',
                 'approved',
-                `Approved payment request #${paymentRequest.id}`,
+                `Approved ${normalizePaymentMethod(paymentRequest.payment_method)} payment request #${paymentRequest.id} (${getPaymentRequestAmountSummary(paymentRequest)})`,
                 paymentRequest.transaction_id,
                 null,
                 paymentRequest.request_ip || null,
@@ -11252,7 +11383,7 @@ app.post('/api/admin/payment-requests/:id/approve', ensureAdmin, async (req, res
             ]
         );
         await applyReferralBonusForApprovedDeposit(client, paymentRequest);
-        await client.query('UPDATE payment_requests SET status = $1, screenshot = NULL WHERE id = $2', ['approved', paymentRequest.id]);
+        await client.query('UPDATE payment_requests SET status = $1, screenshot = NULL, credit_amount = $2 WHERE id = $3', ['approved', creditedAmount, paymentRequest.id]);
         await client.query('COMMIT');
         await removeUploadedFile(screenshotToDelete);
         res.json({ success: true });
