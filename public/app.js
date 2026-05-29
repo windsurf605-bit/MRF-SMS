@@ -63,6 +63,39 @@ const adminAccordion = {
     resizeBound: false
 };
 
+const PAYMENT_METHOD_META = {
+    easypaisa: {
+        key: 'easypaisa',
+        label: 'Easypaisa',
+        minAmount: 100,
+        currency: 'PKR',
+        amountPlaceholder: 'Amount (Minimum 100 PKR)',
+        transactionPlaceholder: 'Easypaisa Transaction ID (optional but recommended)',
+        transactionRequired: false,
+        uploadTitle: 'Upload Easypaisa payment screenshot',
+        guidanceText: 'پیمنٹ کی اسکرین شاٹ اس باکس میں ڈال کر سبمٹ پیمنٹ پر کلک کر دیجیے',
+        guidanceDirection: 'rtl',
+        submitLabel: 'Submit Payment',
+        successTitle: 'آپ کی Easypaisa پیمنٹ Add ہو گئی ہے، کچھ ہی دیر میں آپ کے اکاؤنٹ میں پیسے_ADD کر دیے جائیں گے'
+    },
+    binance: {
+        key: 'binance',
+        label: 'Binance',
+        minAmount: 1,
+        currency: 'USDT',
+        amountPlaceholder: 'Amount sent (Minimum 1 USDT)',
+        transactionPlaceholder: 'Binance Transaction ID',
+        transactionRequired: true,
+        uploadTitle: 'Upload Binance transfer screenshot',
+        guidanceText: 'Send payment using Binance UID Transfer only. Do NOT use blockchain network transfer. Only direct Binance internal transfer accepted. Minimum deposit is 1 USDT.',
+        guidanceDirection: 'ltr',
+        submitLabel: 'Submit Binance Receipt',
+        successTitle: 'Your Binance deposit request has been submitted. After admin approval, your wallet will be credited automatically.'
+    }
+};
+
+const PAYMENT_PROOF_ALLOWED_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp']);
+
 const serviceMeta = {
     whatsapp: {
         label: 'WhatsApp',
@@ -1195,6 +1228,12 @@ function formatMoneyPrecise(value) {
     return `${Number.isInteger(amount) ? amount.toFixed(0) : amount.toFixed(2)} PKR`;
 }
 
+function formatUsdtAmount(value) {
+    const amount = Number(value || 0);
+    if (!Number.isFinite(amount)) return '0 USDT';
+    return `${Number.isInteger(amount) ? amount.toFixed(0) : amount.toFixed(2)} USDT`;
+}
+
 function formatRelativeTime(value) {
     if (!value) return '—';
     return new Date(value).toLocaleString();
@@ -1576,6 +1615,114 @@ function showPaymentFormError(message) {
     errorBox.classList.add('show');
 }
 
+function getPaymentMethodMeta(method) {
+    const normalizedMethod = String(method || 'easypaisa').trim().toLowerCase();
+    return PAYMENT_METHOD_META[normalizedMethod] || PAYMENT_METHOD_META.easypaisa;
+}
+
+function getPaymentCreditAmount(request) {
+    const creditAmount = Number(request?.credit_amount || 0);
+    if (Number.isFinite(creditAmount) && creditAmount > 0) {
+        return creditAmount;
+    }
+    return 0;
+}
+
+function formatPaymentRequestAmountText(request) {
+    const methodMeta = getPaymentMethodMeta(request?.payment_method);
+    if (methodMeta.key === 'binance') {
+        const creditAmount = getPaymentCreditAmount(request);
+        const creditText = creditAmount > 0 ? ` • Credit ${formatMoneyPrecise(creditAmount)}` : '';
+        return `${formatUsdtAmount(request?.amount || 0)}${creditText}`;
+    }
+    return formatMoneyPrecise(request?.amount || 0);
+}
+
+function getPaymentRequestReferenceLabel(request) {
+    return getPaymentMethodMeta(request?.payment_method).key === 'binance'
+        ? 'Binance Transaction ID'
+        : 'Transaction ID';
+}
+
+function getPaymentRequestReferenceValue(request) {
+    const methodMeta = getPaymentMethodMeta(request?.payment_method);
+    if (request?.transaction_id) {
+        return request.transaction_id;
+    }
+    return methodMeta.key === 'binance' ? 'Required for Binance approval' : 'Awaiting verification';
+}
+
+function getPaymentVerificationUrl(request) {
+    const methodMeta = getPaymentMethodMeta(request?.payment_method);
+    if (methodMeta.key !== 'easypaisa' || !request?.transaction_id) {
+        return '';
+    }
+    return `https://easypaisa.com.pk/ticket-check/?ticketNo=${encodeURIComponent(request.transaction_id)}`;
+}
+
+function validatePaymentProofFile(file) {
+    const fileName = String(file?.name || '').trim().toLowerCase();
+    const extension = fileName.includes('.') ? fileName.split('.').pop() : '';
+    return Boolean(extension) && PAYMENT_PROOF_ALLOWED_EXTENSIONS.has(extension);
+}
+
+function setActivePaymentMethod(method = 'easypaisa') {
+    const methodMeta = getPaymentMethodMeta(method);
+    const amountInput = qs('payment-amount-input');
+    const transactionInput = qs('payment-transaction-id-input');
+    const uploadTitle = qs('payment-upload-title');
+    const guidance = qs('payment-method-guidance');
+    const submitButton = qs('submit-payment-btn');
+    const methodInput = qs('payment-method-input');
+    if (methodInput) {
+        methodInput.value = methodMeta.key;
+    }
+    qsa('[data-payment-method-tab]').forEach((button) => {
+        const isActive = String(button.dataset.paymentMethodTab || '') === methodMeta.key;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    });
+    qsa('[data-payment-method-panel]').forEach((panel) => {
+        const isActive = String(panel.dataset.paymentMethodPanel || '') === methodMeta.key;
+        panel.classList.toggle('hidden', !isActive);
+    });
+    if (amountInput) {
+        amountInput.placeholder = methodMeta.amountPlaceholder;
+        amountInput.min = String(methodMeta.minAmount);
+    }
+    if (transactionInput) {
+        transactionInput.placeholder = methodMeta.transactionPlaceholder;
+        transactionInput.required = methodMeta.transactionRequired;
+    }
+    if (uploadTitle) {
+        uploadTitle.textContent = methodMeta.uploadTitle;
+    }
+    if (guidance) {
+        guidance.textContent = methodMeta.guidanceText;
+        guidance.dir = methodMeta.guidanceDirection || 'ltr';
+        guidance.style.textAlign = methodMeta.guidanceDirection === 'rtl' ? 'right' : 'left';
+    }
+    if (submitButton) {
+        submitButton.textContent = methodMeta.submitLabel;
+    }
+    clearPaymentFormError();
+}
+
+function updatePaymentSuccessView(method, result = {}) {
+    const methodMeta = getPaymentMethodMeta(method);
+    const successView = qs('payment-success-view');
+    const successTitle = qs('payment-success-title');
+    if (successView) {
+        successView.dir = methodMeta.guidanceDirection === 'rtl' ? 'rtl' : 'ltr';
+    }
+    if (successTitle) {
+        successTitle.style.textAlign = methodMeta.guidanceDirection === 'rtl' ? 'right' : 'left';
+        successTitle.textContent = result?.paymentLabel
+            ? `${methodMeta.successTitle} (${result.paymentLabel})`
+            : methodMeta.successTitle;
+    }
+}
+
 function clearAuthFormError() {
     const errorBox = qs('auth-form-error');
     if (!errorBox) return;
@@ -1677,6 +1824,8 @@ function resetPaymentModalState() {
     if (qs('payment-screenshot-name')) {
         qs('payment-screenshot-name').textContent = 'Payment screenshot upload کریں';
     }
+    updatePaymentSuccessView('easypaisa');
+    setActivePaymentMethod('easypaisa');
 }
 
 function openAuthModal(mode = 'login') {
@@ -3820,17 +3969,19 @@ function renderPaymentHistoryCards(requests) {
     const container = qs('payment-history-list');
     if (!container) return;
     if (!requests.length) {
-        container.innerHTML = renderEmptyState('No payment requests yet', 'Your submitted add-money requests will appear here after you send an Easypaisa payment.');
+        container.innerHTML = renderEmptyState('No payment requests yet', 'Your submitted Easypaisa and Binance add-money requests will appear here after submission.');
         return;
     }
     const sortedRequests = [...requests].sort((left, right) => new Date(right.created_at) - new Date(left.created_at));
     container.innerHTML = sortedRequests.map((request, index) => {
         const status = String(request.status || 'pending').toLowerCase();
+        const methodMeta = getPaymentMethodMeta(request.payment_method);
+        const verificationUrl = getPaymentVerificationUrl(request);
         const newestBadge = index === 0
             ? '<span class="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-[0.16em] text-emerald-700">Newest</span>'
             : '';
         const proofButton = request.screenshot ? `
-            <button class="btn-soft" data-action="view-payment-proof" data-image="${escapeAttr(getUploadUrl(request.screenshot))}" data-user="${escapeAttr(request.user_name || 'Customer')}" data-email="${escapeAttr(request.user_email || 'Unknown email')}" data-amount="${escapeAttr(formatMoneyPrecise(request.amount))}" data-status="${escapeAttr(formatPaymentStatus(request.status))}">
+            <button class="btn-soft" data-action="view-payment-proof" data-image="${escapeAttr(getUploadUrl(request.screenshot))}" data-user="${escapeAttr(request.user_name || 'Customer')}" data-email="${escapeAttr(request.user_email || 'Unknown email')}" data-amount="${escapeAttr(formatPaymentRequestAmountText(request))}" data-status="${escapeAttr(formatPaymentStatus(request.status))}">
                 <i class="fa-regular fa-image"></i>
                 <span>View Proof</span>
             </button>
@@ -3851,16 +4002,24 @@ function renderPaymentHistoryCards(requests) {
                     <div class="mt-4 grid gap-2 sm:grid-cols-2">
                         <div class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
                             <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">Amount</div>
-                            <div class="mt-2 text-sm font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(request.amount))}</div>
+                            <div class="mt-2 text-sm font-semibold text-slate-900">${escapeHtml(formatPaymentRequestAmountText(request))}</div>
                         </div>
                         <div class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">Transaction ID</div>
-                            <div class="mt-2 break-all text-sm font-semibold text-slate-900">${escapeHtml(request.transaction_id || 'Awaiting verification')}</div>
+                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">${escapeHtml(getPaymentRequestReferenceLabel(request))}</div>
+                            <div class="mt-2 break-all text-sm font-semibold text-slate-900">${escapeHtml(getPaymentRequestReferenceValue(request))}</div>
+                        </div>
+                        <div class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">Payment Method</div>
+                            <div class="mt-2 text-sm font-semibold text-slate-900">${escapeHtml(methodMeta.label)}</div>
+                        </div>
+                        <div class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500">Note</div>
+                            <div class="mt-2 text-sm font-semibold text-slate-900">${escapeHtml(request.note || '—')}</div>
                         </div>
                     </div>
                 </div>
                 <div class="payment-detail-actions">
-                    ${request.transaction_id ? `<a class="btn-soft" href="https://easypaisa.com.pk/ticket-check/?ticketNo=${escapeAttr(request.transaction_id)}" target="_blank"><span>Verify TXID</span></a>` : ''}
+                    ${verificationUrl ? `<a class="btn-soft" href="${escapeAttr(verificationUrl)}" target="_blank" rel="noreferrer"><span>Verify TXID</span></a>` : ''}
                     ${proofButton}
                 </div>
             </article>
@@ -3882,11 +4041,13 @@ function renderAdminPaymentRequests(paymentRequests, legacyTransactions) {
         }))
     ];
     if (!items.length) {
-        return renderEmptyState('No pending requests', 'New Easypaisa transaction IDs will appear here for verification and approval.');
+        return renderEmptyState('No pending requests', 'New Easypaisa and Binance payment requests will appear here for verification and approval.');
     }
     const rows = items.map((item) => {
+        const methodMeta = getPaymentMethodMeta(item.payment_method);
+        const verificationUrl = getPaymentVerificationUrl(item);
         const proofButton = item.screenshot ? `
-            <button class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50" data-action="view-payment-proof" data-image="${escapeAttr(getUploadUrl(item.screenshot))}" data-user="${escapeAttr(item.user_name || 'Customer')}" data-email="${escapeAttr(item.user_email || 'Unknown email')}" data-amount="${escapeAttr(formatMoneyPrecise(item.amount))}" data-status="${escapeAttr(formatStatus(item.status || 'pending'))}">
+            <button class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50" data-action="view-payment-proof" data-image="${escapeAttr(getUploadUrl(item.screenshot))}" data-user="${escapeAttr(item.user_name || 'Customer')}" data-email="${escapeAttr(item.user_email || 'Unknown email')}" data-amount="${escapeAttr(formatPaymentRequestAmountText(item))}" data-status="${escapeAttr(formatStatus(item.status || 'pending'))}">
                 <i class="fa-regular fa-image"></i>
                 <span>Proof</span>
             </button>
@@ -3899,7 +4060,7 @@ function renderAdminPaymentRequests(paymentRequests, legacyTransactions) {
                 </button>
                 <button class="inline-flex items-center gap-1 rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-100" data-action="cancel-payment-request" data-request-id="${escapeAttr(item.id)}">
                     <i class="fa-solid fa-xmark"></i>
-                    <span>Cancel</span>
+                    <span>Reject</span>
                 </button>
             `
             : `
@@ -3915,15 +4076,16 @@ function renderAdminPaymentRequests(paymentRequests, legacyTransactions) {
         return `
             <tr class="border-b border-slate-200 align-top last:border-b-0">
                 <td class="px-4 py-3 font-medium text-slate-600">${escapeHtml(item.source_label)}</td>
+                <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(methodMeta.label)}</td>
                 <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(item.user_name || 'Customer')}</td>
                 <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(item.user_email || 'Unknown email')}</td>
-                <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(item.amount))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatPaymentRequestAmountText(item))}</td>
                 <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(item.transaction_id || `#${item.id}`)}</td>
                 <td class="px-4 py-3 whitespace-nowrap text-slate-500">${escapeHtml(formatRelativeTime(item.created_at))}</td>
                 <td class="px-4 py-3">${proofButton}</td>
                 <td class="px-4 py-3">
                     <div class="flex flex-wrap gap-2">
-                        ${item.transaction_id ? `<a class="inline-flex items-center gap-1 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100" href="https://easypaisa.com.pk/ticket-check/?ticketNo=${escapeAttr(item.transaction_id)}" target="_blank" style="text-decoration:none;"><span>Verify TXID</span></a>` : ''}
+                        ${verificationUrl ? `<a class="inline-flex items-center gap-1 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100" href="${escapeAttr(verificationUrl)}" target="_blank" rel="noreferrer" style="text-decoration:none;"><span>Verify TXID</span></a>` : ''}
                         ${actionButtons}
                     </div>
                 </td>
@@ -3931,9 +4093,9 @@ function renderAdminPaymentRequests(paymentRequests, legacyTransactions) {
         `;
     }).join('');
     return renderAdminTable(
-        ['Source', 'Customer', 'User Email', 'Amount', 'Transaction ID', 'Submitted', 'Proof', 'Actions'],
+        ['Source', 'Method', 'Customer', 'User Email', 'Amount', 'Reference', 'Submitted', 'Proof', 'Actions'],
         rows,
-        'min-w-[1240px]'
+        'min-w-[1360px]'
     );
 }
 
@@ -3942,23 +4104,26 @@ function renderAdminPaymentHistory(paymentRequests) {
         return renderEmptyState('No processed requests', 'Approved and cancelled payment requests will appear here once processed by admin.');
     }
     const rows = paymentRequests.map((request) => {
+        const methodMeta = getPaymentMethodMeta(request.payment_method);
+        const verificationUrl = getPaymentVerificationUrl(request);
         const proofButton = request.screenshot ? `
-            <button class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50" data-action="view-payment-proof" data-image="${escapeAttr(getUploadUrl(request.screenshot))}" data-user="${escapeAttr(request.user_name || 'Customer')}" data-email="${escapeAttr(request.user_email || 'Unknown email')}" data-amount="${escapeAttr(formatMoneyPrecise(request.amount))}" data-status="${escapeAttr(formatStatus(request.status || 'pending'))}">
+            <button class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50" data-action="view-payment-proof" data-image="${escapeAttr(getUploadUrl(request.screenshot))}" data-user="${escapeAttr(request.user_name || 'Customer')}" data-email="${escapeAttr(request.user_email || 'Unknown email')}" data-amount="${escapeAttr(formatPaymentRequestAmountText(request))}" data-status="${escapeAttr(formatStatus(request.status || 'pending'))}">
                 <i class="fa-regular fa-image"></i>
                 <span>View Proof</span>
             </button>
         ` : '<span class="text-xs text-slate-500">No proof</span>';
         return `
             <tr class="border-b border-slate-200 align-top last:border-b-0">
+                <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(methodMeta.label)}</td>
                 <td class="px-4 py-3 font-medium text-slate-900">${escapeHtml(request.user_name || 'Customer')}</td>
                 <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(request.user_email || 'Unknown email')}</td>
-                <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatMoneyPrecise(request.amount))}</td>
+                <td class="px-4 py-3 whitespace-nowrap font-semibold text-slate-900">${escapeHtml(formatPaymentRequestAmountText(request))}</td>
                 <td class="px-4 py-3 break-all text-slate-600">${escapeHtml(request.transaction_id || `#${request.id}`)}</td>
                 <td class="px-4 py-3 whitespace-nowrap text-slate-500">${escapeHtml(formatRelativeTime(request.created_at))}</td>
                 <td class="px-4 py-3">${renderStatusBadge(request.status || 'pending')}</td>
                 <td class="px-4 py-3">
                     <div class="flex flex-wrap gap-2">
-                        ${request.transaction_id ? `<a class="inline-flex items-center gap-1 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100" href="https://easypaisa.com.pk/ticket-check/?ticketNo=${escapeAttr(request.transaction_id)}" target="_blank" style="text-decoration:none;"><span>Verify TXID</span></a>` : ''}
+                        ${verificationUrl ? `<a class="inline-flex items-center gap-1 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100" href="${escapeAttr(verificationUrl)}" target="_blank" rel="noreferrer" style="text-decoration:none;"><span>Verify TXID</span></a>` : ''}
                         ${proofButton}
                     </div>
                 </td>
@@ -3966,9 +4131,9 @@ function renderAdminPaymentHistory(paymentRequests) {
         `;
     }).join('');
     return renderAdminTable(
-        ['Customer', 'User Email', 'Amount', 'Transaction ID', 'Submitted', 'Status', 'Actions'],
+        ['Method', 'Customer', 'User Email', 'Amount', 'Reference', 'Submitted', 'Status', 'Actions'],
         rows,
-        'min-w-[1160px]'
+        'min-w-[1280px]'
     );
 }
 
@@ -4852,7 +5017,7 @@ async function handlePaymentRequestAction(requestId, action) {
     const endpointAction = action === 'approve' ? 'approve' : 'reject';
     const confirmMessage = action === 'approve'
         ? 'Approve this payment request and add balance to the user?'
-        : 'Cancel this payment request without adding funds?';
+        : 'Reject this payment request without adding funds?';
     if (!window.confirm(confirmMessage)) return;
     try {
         const response = await fetch(`/api/admin/payment-requests/${requestId}/${endpointAction}`, {
@@ -4860,7 +5025,7 @@ async function handlePaymentRequestAction(requestId, action) {
             credentials: 'include'
         });
         if (!response.ok) throw new Error(await response.text());
-        showToast(action === 'approve' ? 'Payment request approved successfully' : 'Payment request cancelled successfully', 'success');
+        showToast(action === 'approve' ? 'Payment request approved successfully' : 'Payment request rejected successfully', 'success');
         if (state.currentUser) {
             await refreshUserInfo();
         } else {
@@ -5068,8 +5233,19 @@ function bindStaticEvents() {
     qs('accept-terms-btn')?.addEventListener('click', acceptTermsAndContinue);
     qs('close-payment-modal')?.addEventListener('click', () => closeModal('payment-modal'));
     qs('close-payment-top-alert')?.addEventListener('click', hidePaymentTopAlert);
+    qsa('[data-payment-method-tab]').forEach((button) => {
+        button.addEventListener('click', () => {
+            setActivePaymentMethod(button.dataset.paymentMethodTab);
+        });
+    });
     qs('payment-screenshot-input')?.addEventListener('change', (event) => {
         const file = event.target.files?.[0];
+        if (file && !validatePaymentProofFile(file)) {
+            event.target.value = '';
+            qs('payment-screenshot-name').textContent = 'Payment screenshot upload کریں';
+            showPaymentFormError('Only JPG, JPEG, PNG, and WEBP payment proofs are allowed');
+            return;
+        }
         qs('payment-screenshot-name').textContent = file ? file.name : 'Payment screenshot upload کریں';
         if (file) clearPaymentFormError();
     });
@@ -5081,25 +5257,40 @@ function bindStaticEvents() {
             openAuthModal('login');
             return;
         }
+        const paymentMethod = qs('payment-method-input')?.value || 'easypaisa';
+        const methodMeta = getPaymentMethodMeta(paymentMethod);
         const amount = Number(qs('payment-amount-input').value || 0);
+        const transactionId = qs('payment-transaction-id-input')?.value.trim() || '';
+        const note = qs('payment-note-input')?.value.trim() || '';
         const screenshotFile = qs('payment-screenshot-input')?.files?.[0];
-        if (!amount || amount < 100) {
-            showPaymentFormError('Minimum amount is 100 PKR');
+        if (!amount || amount < methodMeta.minAmount) {
+            showPaymentFormError(methodMeta.key === 'binance' ? 'Minimum Binance deposit is 1 USDT' : 'Minimum amount is 100 PKR');
+            return;
+        }
+        if (methodMeta.transactionRequired && !transactionId) {
+            showPaymentFormError('Binance transaction ID is required');
             return;
         }
         if (!screenshotFile) {
             showPaymentFormError('Screenshot upload is required');
             return;
         }
-        setLoading(button, 'Submitting payment...');
+        if (!validatePaymentProofFile(screenshotFile)) {
+            showPaymentFormError('Only JPG, JPEG, PNG, and WEBP payment proofs are allowed');
+            return;
+        }
+        setLoading(button, methodMeta.key === 'binance' ? 'Submitting Binance receipt...' : 'Submitting payment...');
         try {
             const clientSignals = await getClientSignals();
-            const transactionId = qs('payment-transaction-id-input')?.value.trim() || '';
             const formData = new FormData();
             formData.append('amount', String(amount));
+            formData.append('payment_method', methodMeta.key);
             formData.append('screenshot', screenshotFile);
             if (transactionId) {
                 formData.append('transaction_id', transactionId);
+            }
+            if (note) {
+                formData.append('note', note);
             }
             formData.append('deviceFingerprint', clientSignals.deviceFingerprint);
             formData.append('browserFingerprint', clientSignals.browserFingerprint);
@@ -5109,7 +5300,8 @@ function bindStaticEvents() {
                 credentials: 'include'
             });
             if (!response.ok) throw new Error(await response.text());
-            await response.json();
+            const result = await response.json();
+            updatePaymentSuccessView(methodMeta.key, result || {});
             qs('payment-form-view')?.classList.add('hidden');
             qs('payment-success-view')?.classList.remove('hidden');
             if (state.currentUser) {
@@ -5237,6 +5429,10 @@ function bindStaticEvents() {
         }
         if (action === 'copy-account-number') {
             copyText('03439898333');
+            return;
+        }
+        if (action === 'copy-payment-target') {
+            copyText(actionTarget.dataset.copyValue || '');
             return;
         }
         if (action === 'buy-country') {
