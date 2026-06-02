@@ -4230,6 +4230,7 @@ const whatsappCountries = [
     { name: 'Thailand', code: '+66', price: 300, countryId: 52, flag: '🇹🇭' },
     { name: 'Brazil', code: '+55', price: 370, countryId: 73, flag: '🇧🇷' },
     { name: 'United Kingdom', code: '+44', price: 300, countryId: 16, flag: '🇬🇧' },
+    { name: 'India', code: '+91', price: 370, countryId: 22, flag: '🇮🇳' },
     { name: 'USA', code: '+1', price: 470, countryId: 187, flag: '🇺🇸' },
     { name: 'Chile', code: '+56', price: 170.07, countryId: 151, flag: '🇨🇱' },
     { name: 'Syria', code: '+963', price: 43.32, countryId: 1333, flag: '🇸🇾' },
